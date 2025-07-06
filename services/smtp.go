@@ -6,15 +6,8 @@ import (
 	"strings"
 	"video-streaming-server/config"
 	"video-streaming-server/shared/logger"
+	"video-streaming-server/types"
 )
-
-type message struct {
-	sender     string
-	recipients []string
-	isHTML     bool
-	subject    string
-	body       string
-}
 
 // SendEmail is a wrapper over smtp.SendEmail.
 //
@@ -22,8 +15,8 @@ type message struct {
 //
 // Recipients is an array of string which is joined using comma (,)
 // separator in the function, creating a comma separated string
-func SendEmail(msg *message) error {
-	if len(msg.recipients) == 0 {
+func SendEmail(msg *types.EmailPayload) error {
+	if len(msg.Recipients) == 0 {
 		return errors.New("Recipients should not be emtpy")
 	}
 
@@ -36,17 +29,17 @@ func SendEmail(msg *message) error {
 
 	auth := smtp.PlainAuth("", user, password, host)
 
-	message := "From: " + msg.sender + "\r\n" +
-		"To: " + strings.Join(msg.recipients, ",") + "\r\n" +
-		"Subject: " + msg.subject + "\r\n"
+	message := "From: " + msg.Sender + "\r\n" +
+		"To: " + strings.Join(msg.Recipients, ",") + "\r\n" +
+		"Subject: " + msg.Subject + "\r\n"
 
-	if msg.isHTML {
+	if msg.IsHTML {
 		message += "MIME-version: 1.0;\nContent-Type: text/html; charset=\"UTF-8\";\n\n"
 	}
 
-	message += msg.body
+	message += msg.Body
 
-	err := smtp.SendMail(addr, auth, user, msg.recipients, []byte(message))
+	err := smtp.SendMail(addr, auth, user, msg.Recipients, []byte(message))
 
 	if err != nil {
 		logger.Log.Error(err.Error())

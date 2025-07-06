@@ -135,3 +135,11 @@ type SSEType struct {
 	Event string `json:"event"`
 	Data  any    `json:"data"`
 }
+
+type EmailPayload struct {
+	Sender     string
+	Recipients []string
+	IsHTML     bool
+	Subject    string
+	Body       string
+}
