@@ -47,5 +47,7 @@ func SendEmail(msg *types.EmailPayload) error {
 		return err
 	}
 
+	logger.Log.Info("email sent to recipients", "recipients", msg.Recipients)
+
 	return nil
 }
