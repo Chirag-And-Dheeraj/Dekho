@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+	"video-streaming-server/config"
 	"video-streaming-server/services"
 	"video-streaming-server/shared/logger"
+	"video-streaming-server/types"
 	"video-streaming-server/utils"
 
 	"github.com/go-playground/validator"
@@ -63,6 +65,16 @@ func RegisterUser(w http.ResponseWriter, r *http.Request, userService services.U
 		}
 		return
 	}
+
+	verificationLink, err := utils.GenerateVerificationLink(newUser.Email)
+
+	err = services.SendEmail(&types.EmailPayload{
+		IsHTML: false,
+		Sender: config.AppConfig.SMTPUser,
+		Subject: "Verify Dekho account",
+		Recipients: []string{newUser.Email},
+		Body: "To get access to our services, please verify your account using link " + verificationLink,
+	})
 
 	logger.Log.Info("user registered successfully",
 		"userId", newUser.ID)

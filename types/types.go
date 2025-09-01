@@ -59,6 +59,7 @@ type User struct {
 	Username       string    `json:"username"`
 	Email          string    `json:"email"`
 	HashedPassword []byte    `json:"-"`
+	IsVerified     bool      `json:"is_verified"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -88,6 +89,7 @@ func NewUser(username, email, password string) (*User, error) {
 		HashedPassword: hashedPassword,
 		CreatedAt:      time.Now(),
 		UpdatedAt:      time.Now(),
+		IsVerified:     false,
 	}, nil
 }
 

@@ -56,7 +56,6 @@ func (s *userService) RegisterUser(username, email, password string) (*types.Use
 	}
 
 	return newUser, nil
-
 }
 
 func (s *userService) AuthenticateUser(email, password string) (*types.User, error) {
