@@ -1,11 +1,11 @@
 package main
 
 import (
-	"log/slog"
 	"encoding/json"
 	"fmt"
 	"html"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"os"
 	"regexp"
@@ -212,6 +212,24 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func VerifyHandler(w http.ResponseWriter, r *http.Request) {
+	db, err := database.GetDBConn()
+	if err != nil {
+		logger.Log.Error("failed to get database connection", "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		userRepository := repositories.NewUserRepository(db)
+		userService := services.NewUserService(userRepository)
+
+		tmpl := template.Must(template.ParseFiles("./client/index.html"))
+
+		controllers.VerifyUser(tmpl, w, r, userService)
+	}
+}
+
 func serverSentEventsHandler(w http.ResponseWriter, r *http.Request) {
 	// TODO: talk to Jaden about security review
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -294,6 +312,7 @@ func setUpRoutes() {
 	http.HandleFunc("/register", utils.Chain(registerPageHandler, mw.Logging))
 	http.HandleFunc("/login", utils.Chain(loginPageHandler, mw.Logging))
 	http.HandleFunc("/logout", utils.Chain(logoutHandler, mw.Logging))
+	http.HandleFunc("/verify", VerifyHandler)
 	http.HandleFunc("/upload", utils.Chain(uploadPageHandler, mw.Logging, mw.AuthRequired))
 	http.HandleFunc("/list", utils.Chain(listPageHandler, mw.Logging, mw.AuthRequired))
 	http.HandleFunc("/watch", utils.Chain(watchPageHandler, mw.Logging, mw.AuthRequired))

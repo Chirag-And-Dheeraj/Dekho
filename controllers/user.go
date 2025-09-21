@@ -2,10 +2,14 @@ package controllers
 
 import (
 	"encoding/json"
+	"errors"
+	"html/template"
 	"net/http"
 	"time"
+	"video-streaming-server/config"
 	"video-streaming-server/services"
 	"video-streaming-server/shared/logger"
+	"video-streaming-server/types"
 	"video-streaming-server/utils"
 
 	"github.com/go-playground/validator"
@@ -63,6 +67,16 @@ func RegisterUser(w http.ResponseWriter, r *http.Request, userService services.U
 		}
 		return
 	}
+
+	verificationLink, err := utils.GenerateVerificationLink(newUser.Email)
+
+	err = services.SendEmail(&types.EmailPayload{
+		IsHTML:     false,
+		Sender:     config.AppConfig.SMTPUser,
+		Subject:    "Verify Dekho account",
+		Recipients: []string{newUser.Email},
+		Body:       "To get access to our services, please verify your account using link " + verificationLink,
+	})
 
 	logger.Log.Info("user registered successfully",
 		"userId", newUser.ID)
@@ -149,4 +163,66 @@ func LoginUser(w http.ResponseWriter, r *http.Request, userService services.User
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"message": "Logged in successfully"}`))
+}
+
+func VerifyUser(t *template.Template, w http.ResponseWriter, r *http.Request, userService services.UserService) {
+	token := r.URL.Query().Get("token")
+
+	if token == "" {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		t.Execute(w, map[string]interface{}{
+			"error": "Invalid URL",
+		})
+		return
+	}
+
+	claims, err := utils.DecodeJWT(token)
+	if err != nil {
+		logger.Log.Error(err.Error())
+
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		t.Execute(w, map[string]interface{}{
+			"error": "Invalid URL",
+		})
+		return
+	}
+
+	email, ok := claims["email"].(string)
+	if !ok {
+		logger.Log.Error("`email` not found in token")
+
+		w.WriteHeader(http.StatusInternalServerError)
+		t.Execute(w, map[string]interface{}{
+			"error": "Internal server error",
+		})
+		return
+	}
+
+	user, err := userService.GetUserByEmail(email)
+	if err != nil {
+		logger.Log.Error("User record not found")
+
+		w.WriteHeader(http.StatusBadRequest)
+		t.Execute(w, map[string]interface{}{
+			"error": "User not found",
+		})
+		return
+	}
+
+	err = userService.VerifyUser(user.ID)
+	if err != nil {
+		logger.Log.Error("User verification failed: ", err.Error())
+
+		w.WriteHeader(http.StatusInternalServerError)
+		t.Execute(w, map[string]interface{}{
+			"error": "Internal server error",
+		})
+
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	t.Execute(w, map[string]interface{}{
+		"error": "Successfully Verified",
+	})
 }

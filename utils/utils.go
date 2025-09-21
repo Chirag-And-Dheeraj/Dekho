@@ -779,3 +779,23 @@ func Chain(h http.HandlerFunc, middlewares ...func(http.HandlerFunc) http.Handle
 	}
 	return h
 }
+
+func GenerateVerificationLink(email string) (string, error) {
+	claims := jwt.MapClaims{
+		"email": email,
+		"exp":      time.Now().Add(time.Hour * 72).Unix(),
+	}
+
+	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	token, err := t.SignedString([]byte(config.AppConfig.JWTSecretKey))
+	if err != nil {
+		logger.Log.Error(err.Error())
+
+		return "", err
+	}
+
+	url := fmt.Sprintf("%s?token=%s", config.AppConfig.Hostname + "/verify", token)
+
+	return url, nil
+}

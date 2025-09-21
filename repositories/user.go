@@ -11,6 +11,7 @@ type UserRepository interface {
 	GetUserByEmail(email string) (*types.User, error)
 	GetUserByUsername(username string) (*types.User, error)
 	GetUserByID(id string) (*types.User, error)
+	VerifyUser(id string) error
 }
 
 type userRepository struct {
@@ -77,4 +78,13 @@ func (r *userRepository) GetUserByID(id string) (*types.User, error) {
 		return nil, err
 	}
 	return &user, nil
+}
+
+func (r *userRepository) VerifyUser(id string) error {
+	_, err := r.db.Exec(`UPDATE users SET is_verified = TRUE WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

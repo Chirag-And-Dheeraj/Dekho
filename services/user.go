@@ -14,6 +14,7 @@ type UserService interface {
 	GetUserByEmail(email string) (*types.User, error)
 	GetUserByUsername(username string) (*types.User, error)
 	GetUserByID(id string) (*types.User, error)
+	VerifyUser(id string) error
 }
 
 type userService struct {
@@ -56,7 +57,6 @@ func (s *userService) RegisterUser(username, email, password string) (*types.Use
 	}
 
 	return newUser, nil
-
 }
 
 func (s *userService) AuthenticateUser(email, password string) (*types.User, error) {
@@ -75,4 +75,8 @@ func (s *userService) AuthenticateUser(email, password string) (*types.User, err
 	}
 
 	return user, nil
+}
+
+func (s *userService) VerifyUser(id string) error {
+	return s.repository.VerifyUser(id)
 }
