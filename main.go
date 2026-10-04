@@ -1,11 +1,11 @@
 package main
 
 import (
-	"log/slog"
 	"encoding/json"
 	"fmt"
 	"html"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"os"
 	"regexp"
@@ -42,10 +42,18 @@ func videoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if method == http.MethodPost {
-		controllers.UploadVideo(w, r, db)
+		if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/complete/?$`, path); matched {
+			controllers.CompleteVideoUpload(w, r, db)
+		} else if path == "/video/" {
+			controllers.CreateVideoUpload(w, r, db)
+		} else {
+			utils.SendError(w, http.StatusNotFound, "Not Found")
+		}
 	} else if method == http.MethodGet {
 		if path == "/video/" {
 			controllers.GetVideos(w, r, db)
+		} else if matched, err := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/thumbnail/?$`, path); err == nil && matched {
+			controllers.ThumbnailHandler(w, r, db)
 		} else if matched, err := regexp.MatchString("^/video/[a-zA-B0-9-]+/?$", path); err == nil && matched {
 			controllers.GetVideo(w, r, db)
 		} else if matched, err := regexp.MatchString("^/video/[a-zA-B0-9-]+/stream/?$", path); err == nil && matched {

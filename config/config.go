@@ -26,6 +26,8 @@ type Config struct {
 	AppwriteProjectID      string
 	AppwriteKey            string
 	AppwriteResponseFormat string
+	AppwriteS3Endpoint     string
+	AppwriteS3Region       string
 	DBHost                 string
 	DBPort                 string
 	DBUser                 string
@@ -97,6 +99,8 @@ func LoadConfig(envFile string) error {
 		AppwriteProjectID:      os.Getenv("APPWRITE_PROJECT_ID"),
 		AppwriteKey:            os.Getenv("APPWRITE_KEY"),
 		AppwriteResponseFormat: os.Getenv("APPWRITE_RESPONSE_FORMAT"),
+		AppwriteS3Endpoint:     os.Getenv("APPWRITE_S3_ENDPOINT"),
+		AppwriteS3Region:       os.Getenv("APPWRITE_S3_REGION"),
 		DBHost:                 os.Getenv("DB_HOST"),
 		DBPort:                 os.Getenv("DB_PORT"),
 		DBUser:                 os.Getenv("DB_USER"),
@@ -113,6 +117,9 @@ func LoadConfig(envFile string) error {
 		SMTPPort:     os.Getenv("SMTPPort"),
 		SMTPPassword: os.Getenv("SMTPPassword"),
 		SMTPUser:     os.Getenv("SMTPUser"),
+	}
+	if config.AppwriteS3Region == "" {
+		config.AppwriteS3Region = "auto"
 	}
 
 	if config.JWTSecretKey == "" {

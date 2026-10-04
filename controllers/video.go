@@ -3,132 +3,13 @@ package controllers
 import (
 	"database/sql"
 	"encoding/json"
-	"io"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
-	"time"
-	"video-streaming-server/config"
 	"video-streaming-server/shared/logger"
+	"video-streaming-server/storagekeys"
 	. "video-streaming-server/types"
 	"video-streaming-server/utils"
 )
-
-// @desc Create new video resource
-// @route POST /video
-func UploadVideo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-	fileName := r.Header.Get("file-name")
-	isFirstChunk := r.Header.Get("first-chunk")
-	fileSize, _ := strconv.Atoi(r.Header.Get("file-size"))
-	user, err := utils.GetUserFromRequest(r)
-	title := r.Header.Get("title")
-
-	userID := UserID(user.ID)
-
-	if err != nil {
-		logger.Log.Warn("failed to get user from request", "error", err)
-		utils.SendError(w, http.StatusUnauthorized, "Unauthorized")
-		return
-	}
-	sizeLimit, _ := strconv.Atoi(config.AppConfig.FileSizeLimit)
-
-	if fileSize > sizeLimit {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("File size greater than 15 MB is not acceptable"))
-		return
-	}
-
-	serverFileName := fileName + ".mp4"
-
-	if isFirstChunk == "true" {
-		description := r.Header.Get("description")
-
-		insertStatement, err := db.Prepare(`
-			INSERT INTO 
-				videos
-					(
-						video_id,
-						title,
-						description,
-						upload_initiate_time,
-						status,
-						delete_flag,
-						user_id
-					) 
-				VALUES 
-					($1,$2,$3,$4,$5,$6,$7)
-		`)
-
-		if err != nil {
-			logger.Log.Error("failed to prepare insert statement", "error", err)
-			utils.SendError(w, http.StatusInternalServerError, "Internal Server Error")
-			return
-		}
-
-		_, err = insertStatement.Exec(fileName, title, description, time.Now(), 0, 0, user.ID)
-
-		if err != nil {
-			logger.Log.Error("failed to execute insert statement", "error", err)
-			utils.SendError(w, http.StatusInternalServerError, "Internal Server Error")
-			return
-		}
-	}
-
-	d, _ := io.ReadAll(r.Body)
-
-	var tmpFile *os.File
-
-	if isFirstChunk == "true" {
-		tmpFile, err = os.Create("./video/" + serverFileName)
-		if err != nil {
-			logger.Log.Error("failed to create file", "error", err)
-			utils.SendError(w, http.StatusInternalServerError, "Error processing file")
-			return
-		}
-	} else {
-		tmpFile, err = os.OpenFile("./video/"+serverFileName, os.O_APPEND|os.O_WRONLY, os.ModeAppend)
-		if err != nil {
-			logger.Log.Error("failed to open file for appending", "error", err)
-			utils.SendError(w, http.StatusInternalServerError, "Internal Server Error")
-			return
-		}
-	}
-
-	_, err = tmpFile.Write(d)
-
-	if err != nil {
-		logger.Log.Error("failed to write to file", "error", err)
-		utils.SendError(w, http.StatusInternalServerError, "Internal Server Error")
-		return
-	}
-
-	fileInfo, err := tmpFile.Stat()
-
-	if err != nil {
-		logger.Log.Error("failed to get file info", "error", err)
-		utils.SendError(w, http.StatusInternalServerError, "Internal Server Error")
-		return
-	}
-
-	if fileInfo.Size() == int64(fileSize) {
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte("Video received completely and is now being processed."))
-
-		err := utils.UpdateVideoStatus(db, fileName, UploadedOnServer)
-		if err != nil {
-			logger.Log.Error("failed to update video status", "error", err)
-			utils.SendError(w, http.StatusInternalServerError, "Internal Server Error")
-			return
-		}
-
-		go utils.PostUploadProcessFile(serverFileName, fileName, title, tmpFile, db, userID)
-
-	} else {
-		w.WriteHeader(http.StatusPartialContent)
-		w.Write([]byte("Receiving chunks of the video."))
-	}
-}
 
 // @desc Get All Videos
 // @route GET /video
@@ -306,53 +187,35 @@ func ManifestFileHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 // @desc Get TS File
 // @route GET /video/[id]/stream/[id].ts
 func TSFileHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-	videoName := strings.Split(r.URL.Path[1:], "/")[3]
-	videoComps := strings.Split(videoName, ".")
-	segment := videoComps[0]
-	fileId := utils.GetFileId(segment)
-
-	getSegmentFile := "https://cloud.appwrite.io/v1/storage/buckets/" + config.AppConfig.AppwriteBucketID + "/files/" + fileId + "/view"
-
-	request, err := http.NewRequest(http.MethodGet, getSegmentFile, nil)
-
-	if err != nil {
-		logger.Log.Error("failed to get user from request", "segment", segment, "error", err)
-		utils.SendError(w, http.StatusUnauthorized, "Unauthorized")
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 4 {
+		utils.SendError(w, http.StatusNotFound, "Segment not found")
 		return
 	}
-
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Appwrite-Response-Format", config.AppConfig.AppwriteResponseFormat)
-	request.Header.Set("X-Appwrite-Project", config.AppConfig.AppwriteProjectID)
-	request.Header.Set("X-Appwrite-Key", config.AppConfig.AppwriteKey)
-
-	client := &http.Client{}
-
-	response, err := client.Do(request)
+	videoID, segmentName := parts[1], parts[3]
+	body, err := utils.GetStorageObjectBytes(storagekeys.HLSChunk(videoID, segmentName))
 	if err != nil {
-		logger.Log.Error("failed to fetch segment file", "segment", segment, "error", err)
-		utils.SendError(w, http.StatusInternalServerError, "Internal Server Error")
-		return
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode == 404 {
-		logger.Log.Error("segment file not found", "segment", segment)
+		logger.Log.Error("failed to fetch HLS chunk", "video_id", videoID, "segment", segmentName, "error", err)
 		utils.SendError(w, http.StatusNotFound, "Segment file not found")
 		return
 	}
-
-	bodyBytes, err := io.ReadAll(response.Body)
-
-	if err != nil {
-		logger.Log.Error("failed to read segment file", "segment", segment, "error", err)
-		utils.SendError(w, http.StatusInternalServerError, "Error reading segment file")
-		return
-	}
-
 	w.Header().Set("Content-Type", "video/MP2T")
 	w.WriteHeader(http.StatusOK)
-	w.Write(bodyBytes)
+	_, _ = w.Write(body)
+}
+
+func ThumbnailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	videoID := strings.TrimSuffix(strings.TrimPrefix(path, "/video/"), "/thumbnail")
+	body, err := utils.GetStorageObjectBytes(storagekeys.Thumbnail(videoID))
+	if err != nil {
+		logger.Log.Error("failed to fetch video thumbnail", "video_id", videoID, "error", err)
+		utils.SendError(w, http.StatusNotFound, "Thumbnail not found")
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 // @desc Update Video Details
