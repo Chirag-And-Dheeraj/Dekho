@@ -51,6 +51,22 @@ func PresignPut(ctx context.Context, bucket, key, contentType string) (string, e
 	return request.URL, nil
 }
 
+func PresignGet(ctx context.Context, bucket, key string) (string, error) {
+	client, err := NewS3Client(ctx)
+	if err != nil {
+		return "", err
+	}
+	request, err := s3.NewPresignClient(client).PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	}, func(options *s3.PresignOptions) {
+		options.Expires = 5 * time.Minute
+	})
+	if err != nil {
+		return "", fmt.Errorf("presign S3 download: %w", err)
+	}
+	return request.URL, nil
+}
+
 func PutObject(ctx context.Context, bucket, key, contentType string, body io.Reader, size int64) error {
 	client, err := NewS3Client(ctx)
 	if err != nil {

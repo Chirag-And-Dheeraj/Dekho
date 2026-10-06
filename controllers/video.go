@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"video-streaming-server/config"
 	"video-streaming-server/shared/logger"
+	"video-streaming-server/storage"
 	"video-streaming-server/storagekeys"
 	. "video-streaming-server/types"
 	"video-streaming-server/utils"
@@ -169,39 +171,48 @@ func GetVideo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 // @desc Get Manifest File
 // @route GET /video/[id]/stream
-func ManifestFileHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+func ManifestFileHandler(w http.ResponseWriter, r *http.Request) {
 	videoId := strings.Split(r.URL.Path[1:], "/")[1]
-
-	file, err := utils.GetManifestFile(w, videoId)
-
-	if err != nil {
-		logger.Log.Error("failed to retrieve manifest file", "videoId", videoId, "error", err)
-		utils.SendError(w, http.StatusInternalServerError, "Error retrieving video")
-	} else {
-		w.Header().Set("Content-Type", "application/x-mpegURL")
+	if r.URL.Query().Get("inline") == "1" {
+		manifest, err := utils.GetManifestFile(w, videoId)
+		if err != nil {
+			logger.Log.Error("failed to retrieve HLS manifest", "video_id", videoId, "error", err)
+			utils.SendError(w, http.StatusInternalServerError, "Unable to retrieve video manifest")
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "private, no-store")
 		w.WriteHeader(http.StatusOK)
-		w.Write(file)
+		_, _ = w.Write(manifest)
+		return
 	}
+	url, err := storage.PresignGet(r.Context(), config.AppConfig.AppwriteBucketID, storagekeys.Manifest(videoId))
+	if err != nil {
+		logger.Log.Error("failed to presign HLS manifest", "video_id", videoId, "error", err)
+		utils.SendError(w, http.StatusInternalServerError, "Unable to prepare video manifest")
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	http.Redirect(w, r, url, http.StatusFound)
 }
 
 // @desc Get TS File
 // @route GET /video/[id]/stream/[id].ts
-func TSFileHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+func TSFileHandler(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) != 4 {
 		utils.SendError(w, http.StatusNotFound, "Segment not found")
 		return
 	}
 	videoID, segmentName := parts[1], parts[3]
-	body, err := utils.GetStorageObjectBytes(storagekeys.HLSChunk(videoID, segmentName))
+	url, err := storage.PresignGet(r.Context(), config.AppConfig.AppwriteBucketID, storagekeys.HLSChunk(videoID, segmentName))
 	if err != nil {
-		logger.Log.Error("failed to fetch HLS chunk", "video_id", videoID, "segment", segmentName, "error", err)
-		utils.SendError(w, http.StatusNotFound, "Segment file not found")
+		logger.Log.Error("failed to presign HLS chunk", "video_id", videoID, "segment", segmentName, "error", err)
+		utils.SendError(w, http.StatusInternalServerError, "Unable to prepare video segment")
 		return
 	}
-	w.Header().Set("Content-Type", "video/MP2T")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
+	w.Header().Set("Cache-Control", "private, no-store")
+	http.Redirect(w, r, url, http.StatusFound)
 }
 
 func ThumbnailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {

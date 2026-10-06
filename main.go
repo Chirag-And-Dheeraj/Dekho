@@ -33,6 +33,16 @@ import (
 func videoHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	method := r.Method
+	if method == http.MethodGet {
+		if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/stream/?$`, path); matched {
+			controllers.ManifestFileHandler(w, r)
+			return
+		}
+		if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/stream/[a-zA-Z0-9_-]+\.ts/?$`, path); matched {
+			controllers.TSFileHandler(w, r)
+			return
+		}
+	}
 	db, err := database.GetDBConn()
 
 	if err != nil {
@@ -56,10 +66,6 @@ func videoHandler(w http.ResponseWriter, r *http.Request) {
 			controllers.ThumbnailHandler(w, r, db)
 		} else if matched, err := regexp.MatchString("^/video/[a-zA-B0-9-]+/?$", path); err == nil && matched {
 			controllers.GetVideo(w, r, db)
-		} else if matched, err := regexp.MatchString("^/video/[a-zA-B0-9-]+/stream/?$", path); err == nil && matched {
-			controllers.ManifestFileHandler(w, r, db)
-		} else if matched, err := regexp.MatchString("^/video/[a-zA-B0-9-]+/stream/[a-zA-B0-9_-]+.ts/?$", r.URL.Path); err == nil && matched {
-			controllers.TSFileHandler(w, r, db)
 		} else {
 			response := fmt.Sprintf("Error: handler for %s not found", html.EscapeString(r.URL.Path))
 			http.Error(w, response, http.StatusNotFound)
