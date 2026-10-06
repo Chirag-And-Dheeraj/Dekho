@@ -21,6 +21,7 @@ Dekho is a research and study project aimed at understanding and learning about 
 - Clone the repository
 - Create an **_[Appwrite storage bucket](https://appwrite.io/docs/products/storage)_**
   - Make sure that you make a note of `APPWRITE_KEY`, `APPWRITE_PROJECT_ID` and the `BUCKET_ID`.
+  - Set `APPWRITE_S3_ENDPOINT` to the project's regional S3 endpoint (for example, `https://fra.cloud.appwrite.io/v1/s3`) and `APPWRITE_S3_REGION` to `auto` or the Appwrite region code. The API key needs Storage read and write scopes.
 
 ### With Docker
 
@@ -56,6 +57,8 @@ Dekho is a research and study project aimed at understanding and learning about 
 - **Frontend:** HTML, CSS, JS
 
 ## Project Architecture
+
+Appwrite S3 object keys use `raw_files/<videoID><extension>`, `hls_chunks/<videoID>/<chunk>.ts`, `manifests/<videoID>.m3u8`, and `thumbnails/<videoID>.png`.
 
 ![Architecture Diagram](documentation/static/dekho-architecture.excalidraw.png)
 

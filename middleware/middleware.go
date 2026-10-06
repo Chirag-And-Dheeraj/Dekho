@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"video-streaming-server/shared/logger"
 	"video-streaming-server/utils"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 func AuthRequired(next http.HandlerFunc) http.HandlerFunc {
@@ -27,14 +29,15 @@ func AuthRequired(next http.HandlerFunc) http.HandlerFunc {
 
 func Logging(next http.HandlerFunc) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u, _ := utils.GetUserFromRequest(r)
-
-		var userID string
-
-		if u != nil {
-			userID = u.ID
-		} else {
-			userID = "anonymous"
+		userID := "anonymous"
+		if cookie, err := r.Cookie("auth_token"); err == nil {
+			if token, err := utils.VerifyToken(cookie.Value); err == nil && token.Valid {
+				if claims, ok := token.Claims.(jwt.MapClaims); ok {
+					if id, ok := claims["user_id"].(string); ok {
+						userID = id
+					}
+				}
+			}
 		}
 
 		logger.Log.Info("http request",

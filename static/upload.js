@@ -13,172 +13,95 @@ const progressBar = document.getElementById("progressBar");
 let uploadInProgress = false;
 
 function handleBeforeUnload(event) {
-  console.log("beforeunload triggered, uploadInProgress:", uploadInProgress);
-  if (uploadInProgress) {
-    console.log("Preventing navigation - upload in progress");
-    event.preventDefault();
-    event.returnValue = "Upload is in progress. Are you sure you want to leave?";
-    return "Upload is in progress. Are you sure you want to leave?";
-  }
+  if (!uploadInProgress) return;
+  event.preventDefault();
+  event.returnValue = "Upload is in progress. Are you sure you want to leave?";
 }
 
 function checkFileType(file) {
-  const supportedTypes = JSON.parse(localStorage.getItem("SUPPORTED_FILE_TYPES"));
-
-  if (!supportedTypes.some((supportedType) => supportedType.file_type === file.type)) {
-    console.log(file.type);
-    const supportedExtensions = supportedTypes.map((type) => type.file_extension).join(", ");
-
-    fileError.textContent = `Only ${supportedExtensions} files are supported`;
+  const supportedTypes = JSON.parse(localStorage.getItem("SUPPORTED_FILE_TYPES") || "[]");
+  if (!supportedTypes.some((type) => type.file_type === file.type)) {
+    const extensions = supportedTypes.map((type) => type.file_extension).join(", ");
+    fileError.textContent = `Only ${extensions} files are supported`;
     fileError.style.display = "block";
     return false;
   }
   return true;
 }
 
-fileForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
+function uploadToStorage(url, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("PUT", url);
+    request.setRequestHeader("Content-Type", file.type);
+    request.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+    });
+    request.addEventListener("load", () => {
+      if (request.status >= 200 && request.status < 300) resolve();
+      else reject(new Error(`Storage upload failed (${request.status})`));
+    });
+    request.addEventListener("error", () => reject(new Error("Storage upload failed. Check your connection and try again.")));
+    request.addEventListener("abort", () => reject(new Error("Upload was cancelled.")));
+    request.send(file);
+  });
+}
 
-  const title = titleElement.value;
-  const description = descriptionElement.value;
+fileForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const title = titleElement.value.trim();
+  const description = descriptionElement.value.trim();
+  const file = video.files[0];
   const regex = /^[a-zA-Z0-9\s\-_',.!&():]+$/;
 
-  // Do all validation BEFORE setting uploadInProgress
-  if (!regex.test(title)) {
-    titleError.textContent = "Invalid Title";
-    titleError.style.display = "block";
-    return;
-  }
-
-  if (!regex.test(description)) {
-    descriptionError.textContent = "Invalid Description";
-    descriptionError.style.display = "block";
-    return;
-  }
-
-  const fileReader = new FileReader();
-  const theFile = video.files[0];
-
-  if (!theFile) {
-    fileError.textContent = "Please select a file";
-    fileError.style.display = "block";
-    return;
-  }
-
-  const size = theFile.size;
-
-  console.log(`file type = ${theFile.type}`);
-
-  if (!checkFileType(theFile)) {
-    return;
-  }
-
-  const sizeLimit = localStorage.getItem("FILE_SIZE_LIMIT");
-  if (size > sizeLimit) {
+  if (!regex.test(title)) { titleError.textContent = "Invalid Title"; titleError.style.display = "block"; return; }
+  if (!regex.test(description)) { descriptionError.textContent = "Invalid Description"; descriptionError.style.display = "block"; return; }
+  if (!file) { fileError.textContent = "Please select a file"; fileError.style.display = "block"; return; }
+  if (!checkFileType(file)) return;
+  const sizeLimit = Number(localStorage.getItem("FILE_SIZE_LIMIT"));
+  if (sizeLimit && file.size > sizeLimit) {
     fileError.textContent = `File size is greater than ${sizeLimit / (1024 * 1024)} MB`;
     fileError.style.display = "block";
     return;
   }
-
-  // Only set uploadInProgress and add listener AFTER all validation passes
-  uploadInProgress = true;
-  window.addEventListener("beforeunload", handleBeforeUnload);
-  console.log("Upload started - navigation protection enabled");
 
   titleError.style.display = "none";
   descriptionError.style.display = "none";
   fileError.style.display = "none";
   progressContainer.style.display = "block";
   progressBar.style.width = "0%";
-  divOutput.textContent = "Uploading...";
-
+  divOutput.textContent = "Preparing upload...";
+  uploadInProgress = true;
+  window.addEventListener("beforeunload", handleBeforeUnload);
   uploadVideoButton.disabled = true;
 
-  fileReader.onload = async (ev) => {
-    const CHUNK_SIZE = 50000;
-    const chunkCount = parseInt(ev.target.result.byteLength / CHUNK_SIZE);
-    console.log(chunkCount);
-    console.log("Read successfully");
-
-    import("https://jspm.dev/uuid").then(async (uuid) => {
-      const uuidv4 = uuid.v4;
-      const fileName = uuidv4();
-      console.log(fileName);
-      let sent = 0;
-      let chunkID;
-      for (chunkID = 0; chunkID < chunkCount + 1; chunkID++) {
-        console.log(chunkID);
-        let chunk;
-        if (chunkID == chunkCount) {
-          chunk = ev.target.result.slice(chunkID * CHUNK_SIZE);
-        } else {
-          chunk = ev.target.result.slice(chunkID * CHUNK_SIZE, chunkID * CHUNK_SIZE + CHUNK_SIZE);
-        }
-        console.log("Chunk byteLength: ", chunk.byteLength);
-        sent += chunk.byteLength;
-        firstChunk = false;
-        if (chunkID == 0) {
-          firstChunk = true;
-        }
-        // reason for await is we want to wait for server's response and not flood the backend with all requests.
-        const response = await fetch(`${window.ENV.API_URL}/video/`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/octet-stream",
-            "content-length": chunk.length,
-            "file-name": fileName,
-            "file-size": ev.target.result.byteLength,
-            "first-chunk": firstChunk,
-            title: title,
-            description: description,
-          },
-          body: chunk,
-        });
-
-        console.log(await response.text());
-
-        divOutput.textContent = `${Math.round((sent / ev.target.result.byteLength) * 100, 0)} %`;
-
-        const progress = Math.round((sent / ev.target.result.byteLength) * 100);
-        progressBar.style.width = `${progress}%`;
-        divOutput.textContent = `${progress}%`;
-      }
-
-      if (chunkID >= chunkCount + 1) {
-        progressBar.style.width = "100%";
-        uploadInProgress = false;
-        window.removeEventListener("beforeunload", handleBeforeUnload);
-        console.log("Upload completed - navigation protection disabled");
-
-        const COUNTDOWN_DURATION = 5;
-
-        // Create a more detailed message container with countdown
-        divOutput.innerHTML = `
-          <div style="text-align: center;">
-            <p>✅ Upload complete! Your video will be available soon on the List Files page.</p>
-            <p>Redirecting in <span id="countdown" style="font-weight: bold; color: #ff8e8e; font-size: 1.2em;">${COUNTDOWN_DURATION}</span> seconds...</p>
-            <button onclick="window.location.href='/list'" style="margin-top: 10px; padding: 8px 16px; background: #a0a0ff; color: white; border: none; border-radius: 4px; cursor: pointer;">
-              Go Now
-            </button>
-          </div>
-        `;
-
-        let countdown = COUNTDOWN_DURATION;
-        const countdownElement = document.getElementById("countdown");
-
-        const countdownInterval = setInterval(() => {
-          countdown--;
-          countdownElement.textContent = countdown;
-
-          if (countdown <= 0) {
-            clearInterval(countdownInterval);
-            window.location.href = "/list";
-          }
-        }, 1000);
-      }
-      console.log(`Successfully sent ${sent} bytes from the client.`);
+  try {
+    const createResponse = await fetch(`${window.ENV.API_URL}/video/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, description, file_name: file.name, file_size: file.size, content_type: file.type }),
     });
-  };
+    if (!createResponse.ok) throw new Error(await createResponse.text() || "Unable to start upload");
+    const { video_id: videoID, upload_url: uploadURL } = await createResponse.json();
 
-  fileReader.readAsArrayBuffer(theFile);
+    divOutput.textContent = "Uploading directly to storage...";
+    await uploadToStorage(uploadURL, file, (progress) => {
+      progressBar.style.width = `${progress}%`;
+      divOutput.textContent = `${progress}%`;
+    });
+
+    divOutput.textContent = "Confirming upload...";
+    const completeResponse = await fetch(`${window.ENV.API_URL}/video/${videoID}/complete`, { method: "POST" });
+    if (!completeResponse.ok) throw new Error(await completeResponse.text() || "Unable to confirm upload");
+
+    progressBar.style.width = "100%";
+    divOutput.textContent = "Upload complete! Your video is processing. Redirecting to your videos...";
+    window.setTimeout(() => { window.location.href = "/list"; }, 2500);
+  } catch (error) {
+    divOutput.textContent = error.message || "Upload failed. Please try again.";
+    uploadVideoButton.disabled = false;
+  } finally {
+    uploadInProgress = false;
+    window.removeEventListener("beforeunload", handleBeforeUnload);
+  }
 });
