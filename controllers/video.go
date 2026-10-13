@@ -218,15 +218,25 @@ func TSFileHandler(w http.ResponseWriter, r *http.Request) {
 func ThumbnailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	videoID := strings.TrimSuffix(strings.TrimPrefix(path, "/video/"), "/thumbnail")
-	body, err := utils.GetStorageObjectBytes(storagekeys.Thumbnail(videoID))
+	var exists bool
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM videos WHERE video_id=$1 AND delete_flag=0)`, videoID).Scan(&exists)
 	if err != nil {
-		logger.Log.Error("failed to fetch video thumbnail", "video_id", videoID, "error", err)
+		logger.Log.Error("failed to look up video for thumbnail", "video_id", videoID, "error", err)
+		utils.SendError(w, http.StatusInternalServerError, "Unable to retrieve thumbnail")
+		return
+	}
+	if !exists {
 		utils.SendError(w, http.StatusNotFound, "Thumbnail not found")
 		return
 	}
-	w.Header().Set("Content-Type", "image/png")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
+	thumbnailURL, err := storage.PresignGet(r.Context(), config.AppConfig.AppwriteBucketID, storagekeys.Thumbnail(videoID))
+	if err != nil {
+		logger.Log.Error("failed to presign thumbnail", "video_id", videoID, "error", err)
+		utils.SendError(w, http.StatusInternalServerError, "Unable to retrieve thumbnail")
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	http.Redirect(w, r, thumbnailURL, http.StatusFound)
 }
 
 // @desc Update Video Details
