@@ -1,41 +1,134 @@
 package utils
 
 import (
-	"bytes"
-	"crypto/sha1"
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"log/slog"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"video-streaming-server/config"
 	"video-streaming-server/database"
 	"video-streaming-server/repositories"
 	"video-streaming-server/shared"
 	"video-streaming-server/shared/logger"
+	"video-streaming-server/storage"
+	"video-streaming-server/storagekeys"
 	"video-streaming-server/types"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/golang-jwt/jwt/v5"
 )
 
-var videoProcessing *slog.Logger
+var videoProcessingJobs = struct {
+	sync.Mutex
+	cancel map[string]context.CancelFunc
+}{cancel: make(map[string]context.CancelFunc)}
 
-func extractThumbnail(videoPath string, fileName string) (string, error) {
+func CancelVideoProcessing(videoID string) {
+	videoProcessingJobs.Lock()
+	if cancel := videoProcessingJobs.cancel[videoID]; cancel != nil {
+		cancel()
+	}
+	videoProcessingJobs.Unlock()
+}
 
-	if err := os.Mkdir(fmt.Sprintf("thumbnails/%s", fileName), os.ModePerm); err != nil {
-		return "", fmt.Errorf("error creating thumbnail directory: %w", err)
+func BeginVideoProcessing(ctx context.Context, db *sql.DB, videoID string) (context.Context, func(), error) {
+	processingCtx, cancel := context.WithCancel(ctx)
+	videoProcessingJobs.Lock()
+	if videoProcessingJobs.cancel[videoID] != nil {
+		videoProcessingJobs.Unlock()
+		cancel()
+		return nil, nil, fmt.Errorf("video %q is already being processed", videoID)
+	}
+	videoProcessingJobs.cancel[videoID] = cancel
+	videoProcessingJobs.Unlock()
+
+	conn, err := db.Conn(processingCtx)
+	if err != nil {
+		finishVideoProcessing(videoID, cancel, nil)
+		return nil, nil, fmt.Errorf("get database connection for video processing: %w", err)
+	}
+	if _, err := conn.ExecContext(processingCtx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, videoID); err != nil {
+		discardSQLConn(conn)
+		finishVideoProcessing(videoID, cancel, nil)
+		return nil, nil, fmt.Errorf("lock video processing: %w", err)
 	}
 
-	cmd := exec.Command("ffmpeg", "-y", "-i", videoPath, "-frames:v", "1", config.AppConfig.RootPath+"/thumbnails/"+fileName+"/"+fileName+"_thumbnail.png")
+	var active bool
+	if err := db.QueryRowContext(processingCtx, `SELECT EXISTS(SELECT 1 FROM videos WHERE video_id=$1 AND delete_flag=0)`, videoID).Scan(&active); err != nil {
+		unlockVideo(conn, videoID)
+		finishVideoProcessing(videoID, cancel, nil)
+		return nil, nil, fmt.Errorf("check video before processing: %w", err)
+	}
+	if !active {
+		unlockVideo(conn, videoID)
+		finishVideoProcessing(videoID, cancel, nil)
+		return nil, nil, context.Canceled
+	}
+	return processingCtx, func() { finishVideoProcessing(videoID, cancel, conn) }, nil
+}
+
+func finishVideoProcessing(videoID string, cancel context.CancelFunc, conn *sql.Conn) {
+	if conn != nil {
+		unlockVideo(conn, videoID)
+	}
+	cancel()
+	videoProcessingJobs.Lock()
+	delete(videoProcessingJobs.cancel, videoID)
+	videoProcessingJobs.Unlock()
+}
+
+func unlockVideo(conn *sql.Conn, videoID string) {
+	if _, err := conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, videoID); err != nil {
+		discardSQLConn(conn)
+		return
+	}
+	_ = conn.Close()
+}
+
+func discardSQLConn(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	_ = conn.Close()
+}
+
+func lockVideoDeletion(ctx context.Context, db *sql.DB, videoID string) (*sql.Conn, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get database connection for video deletion: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, videoID); err != nil {
+		discardSQLConn(conn)
+		return nil, fmt.Errorf("lock video deletion: %w", err)
+	}
+	return conn, nil
+}
+
+func AcquireVideoLock(ctx context.Context, db *sql.DB, videoID string) (func(), error) {
+	conn, err := lockVideoDeletion(ctx, db, videoID)
+	if err != nil {
+		return nil, err
+	}
+	return func() { unlockVideo(conn, videoID) }, nil
+}
+
+func extractThumbnail(ctx context.Context, videoPath string, fileName string) (string, error) {
+	thumbnailPath := filepath.Join(config.AppConfig.RootPath, storagekeys.ThumbnailsFolder, fileName+".png")
+	if err := os.MkdirAll(filepath.Dir(thumbnailPath), os.ModePerm); err != nil {
+		return "", fmt.Errorf("error creating thumbnail directory: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-protocol_whitelist", "file", "-i", videoPath, "-frames:v", "1", thumbnailPath)
 
 	output, err := cmd.CombinedOutput()
 
@@ -43,283 +136,191 @@ func extractThumbnail(videoPath string, fileName string) (string, error) {
 		return "", fmt.Errorf("error extracting thumbnail: %w, output: %s", err, string(output))
 	}
 
-	return config.AppConfig.RootPath + "/thumbnails/" + fileName + "/" + fileName + "_thumbnail.png", nil
+	return thumbnailPath, nil
 }
 
-func uploadThumbnailToAppwrite(folderName string, db *sql.DB) (string, error) {
-	videoProcessing.Debug("Uploading thumbnail of to Appwrite", "video_id", folderName)
-	files, err := os.ReadDir(fmt.Sprintf("thumbnails/%s", folderName))
-
+func uploadThumbnailToStorage(ctx context.Context, videoID string, db *sql.DB) (string, error) {
+	videoProcessing := logger.Log.With("video_id", videoID)
+	thumbnailPath := filepath.Join(config.AppConfig.RootPath, storagekeys.ThumbnailsFolder, videoID+".png")
+	file, err := os.Open(thumbnailPath)
 	if err != nil {
-		return "", fmt.Errorf("error reading thumbnail directory: %w", err)
+		return "", fmt.Errorf("open thumbnail: %w", err)
 	}
-
-	if len(files) == 0 {
-		err = os.Remove("thumbnails/" + folderName)
-		if err != nil {
-			return "", fmt.Errorf("error removing empty thumbnail directory: %w", err)
-		}
-	}
-
-	fileToUpload, err := os.ReadFile(fmt.Sprintf("thumbnails/%s/%s", folderName, files[0].Name()))
-
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil {
-		return "", fmt.Errorf("error reading thumbnail file: %w", err)
+		return "", fmt.Errorf("stat thumbnail: %w", err)
 	}
-
-	uploadRequestURL := "https://cloud.appwrite.io/v1/storage/buckets/" + config.AppConfig.AppwriteBucketID + "/files"
-
-	var requestBody bytes.Buffer
-	writer := multipart.NewWriter(&requestBody)
-	fileComps := strings.Split(files[0].Name(), ".")
-	fileId := GetFileId(fileComps[0])
-
-	err = writer.WriteField("fileId", fileId)
-	if err != nil {
-		return "", fmt.Errorf("error writing fileId field: %w", err)
-	}
-
-	part, err := writer.CreateFormFile("file", files[0].Name())
-
-	if err != nil {
-		return "", fmt.Errorf("error creating form file part: %w", err)
-	}
-
-	_, err = part.Write(fileToUpload)
-
-	if err != nil {
-		return "", fmt.Errorf("error writing file content to form part: %w", err)
-	}
-
-	err = writer.Close()
-
-	if err != nil {
-		return "", fmt.Errorf("error closing multipart writer: %w", err)
-	}
-
-	request, err := http.NewRequest(http.MethodPost, uploadRequestURL, &requestBody)
-	if err != nil {
-		return "", fmt.Errorf("error creating request: %w", err)
-	}
-
-	request.Header.Set("Content-Type", writer.FormDataContentType())
-	request.Header.Set("X-Appwrite-Response-Format", config.AppConfig.AppwriteResponseFormat)
-	request.Header.Set("X-Appwrite-Project", config.AppConfig.AppwriteProjectID)
-	request.Header.Set("X-Appwrite-Key", config.AppConfig.AppwriteKey)
-
-	client := &http.Client{}
-	response, err := client.Do(request)
-	if err != nil {
-		return "", fmt.Errorf("error sending request to Appwrite: %w", err)
-	}
-	defer response.Body.Close()
-
-	thumbnailURL := ""
-
-	if response.StatusCode != 201 {
-		body, err := io.ReadAll(response.Body)
-		if err != nil {
-			return "", fmt.Errorf("error reading response body: %w", err)
-		}
-		videoProcessing.Error("error uploading thumbnail to Appwrite Storage",
-			"status_code", response.StatusCode,
-			"response_body", string(body),
-			"file_name", files[0].Name())
-	} else {
-		var uploadResponse types.ThumbnailUploadResponse
-		err := json.NewDecoder(response.Body).Decode(&uploadResponse)
-		if err != nil {
-			return "", fmt.Errorf("error decoding response body: %w", err)
-		}
-		err = os.Remove("thumbnails/" + folderName + "/" + files[0].Name())
-		if err != nil {
-			return "", fmt.Errorf("error removing thumbnail file after upload: %w", err)
-		}
-
-		updateStatement, err := db.Prepare(`
-			UPDATE
-				videos
-			SET
-				thumbnail=$1
-			WHERE
-				video_id=$2;
-		`)
-
-		if err != nil {
-			return "", fmt.Errorf("error preparing update statement: %w", err)
-		}
-
-		thumbnailURL = fmt.Sprintf("https://cloud.appwrite.io/v1/storage/buckets/%s/files/%s/view?project=%s", uploadResponse.BucketID, uploadResponse.ID, config.AppConfig.AppwriteProjectID)
-
-		videoProcessing.Debug("thumbnail URL", "thumbnail_url", thumbnailURL)
-
-		_, err = updateStatement.Exec(thumbnailURL, folderName)
-		if err != nil {
-			return "", fmt.Errorf("error updating database record: %w", err)
-		}
-
-		videoProcessing.Info("thumbnail URL updated in database", "thumbnail_url", thumbnailURL)
-	}
-
-	err = os.Remove("thumbnails/" + folderName)
-	if err != nil {
-		log.Println(err)
+	key := storagekeys.Thumbnail(videoID)
+	if err := storage.PutObject(ctx, config.AppConfig.AppwriteBucketID, key, "image/png", file, info.Size()); err != nil {
 		return "", err
 	}
+	thumbnailURL := "/video/" + videoID + "/thumbnail"
+	result, err := db.ExecContext(ctx, `UPDATE videos SET thumbnail=$1 WHERE video_id=$2 AND delete_flag=0`, thumbnailURL, videoID)
+	if err != nil {
+		return "", fmt.Errorf("update thumbnail URL in database: %w", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows == 0 {
+		return "", context.Canceled
+	}
+	if err := os.Remove(thumbnailPath); err != nil {
+		return "", fmt.Errorf("remove local thumbnail: %w", err)
+	}
+	videoProcessing.Info("thumbnail uploaded to S3 storage", "object_key", key)
 	return thumbnailURL, nil
 }
 
-func breakFile(videoPath string, fileName string) error {
-	videoProcessing.Debug("Breaking file into segments", "video_path", videoPath)
-
-	if err := os.Mkdir(fmt.Sprintf("segments/%s", fileName), os.ModePerm); err != nil {
-		return fmt.Errorf("error creating segments directory: %w", err)
+func breakFile(ctx context.Context, videoPath string, videoID string, db *sql.DB) error {
+	videoProcessing := logger.Log.With("video_id", videoID)
+	videoProcessing.Debug("Breaking file into HLS chunks", "video_path", videoPath)
+	hlsDirectory := filepath.Join(config.AppConfig.RootPath, storagekeys.HLSChunksFolder, videoID)
+	manifestPath := filepath.Join(config.AppConfig.RootPath, storagekeys.ManifestsFolder, videoID+".m3u8")
+	if err := os.MkdirAll(hlsDirectory, os.ModePerm); err != nil {
+		return fmt.Errorf("create HLS chunk directory: %w", err)
 	}
-
-	metaData, err := extractMetaData(videoPath)
-	videoCodec := ""
-	audioCodec := ""
+	if err := os.MkdirAll(filepath.Dir(manifestPath), os.ModePerm); err != nil {
+		return fmt.Errorf("create manifest directory: %w", err)
+	}
+	metaData, err := extractMetaData(ctx, videoPath)
 	if err != nil {
-		return fmt.Errorf("error extracting metadata: %w", err)
-	} else {
-		for _, codecs := range metaData.Streams {
-			switch codecs.CodecType {
-			case "video":
-				videoCodec = codecs.CodecName
-			case "audio":
-				audioCodec = codecs.CodecName
-			}
-		}
-
-		videoProcessing.Debug("Extracted video and audio codecs", "video_codec", videoCodec, "audio_codec", audioCodec)
+		return fmt.Errorf("extract video metadata: %w", err)
 	}
-
-	videoCodecAction := "copy"
-	audioCodecAction := "copy"
-
+	if !videoProcessingActive(ctx, db, videoID) {
+		return context.Canceled
+	}
+	videoCodec, audioCodec := "", ""
+	for _, stream := range metaData.Streams {
+		switch stream.CodecType {
+		case "video":
+			videoCodec = stream.CodecName
+		case "audio":
+			audioCodec = stream.CodecName
+		}
+	}
+	videoCodecAction, audioCodecAction := "copy", "copy"
 	if videoCodec != "h264" {
 		videoProcessing.Info("Converting video codec", "old_video_codec", videoCodec, "new_video_codec", "h264")
 		videoCodecAction = "libx264"
 	}
-
 	if audioCodec != "aac" {
 		videoProcessing.Info("Converting audio codec", "old_audio_codec", audioCodec, "new_audio_codec", "aac")
 		audioCodecAction = "aac"
 	}
-
-	cmd := exec.Command("ffmpeg", "-y", "-i", videoPath, "-c:v", videoCodecAction, "-preset", "veryfast", "-c:a", audioCodecAction, "-map", "0", "-f", "segment", "-segment_time", "4", "-segment_format", "mpegts", "-segment_list", config.AppConfig.RootPath+"/segments/"+fileName+"/"+fileName+".m3u8", "-segment_list_type", "m3u8", config.AppConfig.RootPath+"/segments/"+fileName+"/"+fileName+"_"+"segment_no_%d.ts")
-
+	segmentPattern := filepath.Join(hlsDirectory, videoID+"_segment_no_%d.ts")
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-protocol_whitelist", "file", "-i", videoPath, "-c:v", videoCodecAction, "-preset", "veryfast", "-c:a", audioCodecAction, "-map", "0", "-f", "segment", "-segment_time", "4", "-segment_format", "mpegts", "-segment_list", manifestPath, "-segment_list_type", "m3u8", segmentPattern)
 	output, err := cmd.CombinedOutput()
-
 	if err != nil {
-		return fmt.Errorf("error breaking file into segments: %w, output: %s", err, string(output))
+		return fmt.Errorf("break file into HLS chunks: %w, output: %s", err, string(output))
 	}
-
 	return nil
 }
 
-func uploadToAppwrite(folderName string) error {
-	// TODO: Add a deferred cleanup function
-	files, err := os.ReadDir(fmt.Sprintf("segments/%s", folderName))
-
+func uploadHLSAssetsToStorage(ctx context.Context, videoID string, db *sql.DB) (err error) {
+	videoProcessing := logger.Log.With("video_id", videoID)
+	client, err := storage.NewS3Client(ctx)
 	if err != nil {
-		return fmt.Errorf("error reading segments directory: %w", err)
+		return fmt.Errorf("create S3 client: %w", err)
 	}
-
-	if len(files) == 0 {
-		err = os.Remove("segments/" + folderName)
-		if err != nil {
-			return fmt.Errorf("error removing empty segments directory: %w", err)
+	defer func() {
+		if err == nil {
+			return
 		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if cleanupErr := deleteHLSAssetsFromStorage(cleanupCtx, client, videoID); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("roll back partially uploaded HLS assets: %w", cleanupErr))
+		}
+	}()
+	hlsDirectory := filepath.Join(config.AppConfig.RootPath, storagekeys.HLSChunksFolder, videoID)
+	files, err := os.ReadDir(hlsDirectory)
+	if err != nil {
+		return fmt.Errorf("read HLS chunk directory: %w", err)
 	}
-
-	videoProcessing.Debug("Now uploading segments to Appwrite Storage")
-	var count int = -1
-	for idx, file := range files {
-		fileToUpload, err := os.ReadFile(fmt.Sprintf("segments/%s/%s", folderName, file.Name()))
-
+	for _, entry := range files {
+		if !videoProcessingActive(ctx, db, videoID) {
+			return context.Canceled
+		}
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".ts" {
+			continue
+		}
+		filePath := filepath.Join(hlsDirectory, entry.Name())
+		file, err := os.Open(filePath)
 		if err != nil {
-			return fmt.Errorf("error reading segment file: %w", err)
+			return fmt.Errorf("open HLS chunk: %w", err)
 		}
-
-		uploadRequestURL := "https://cloud.appwrite.io/v1/storage/buckets/" + config.AppConfig.AppwriteBucketID + "/files"
-
-		var requestBody bytes.Buffer
-		writer := multipart.NewWriter(&requestBody)
-
-		fileId := "nil"
-		fileComps := strings.Split(file.Name(), ".")
-		if fileComps[1] == "m3u8" {
-			fileId = fileComps[0]
-		} else {
-			fileId = GetFileId(fileComps[0])
+		info, err := file.Stat()
+		if err == nil {
+			_, err = client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: aws.String(config.AppConfig.AppwriteBucketID), Key: aws.String(storagekeys.HLSChunk(videoID, entry.Name())),
+				ContentType: aws.String("video/MP2T"), Body: file, ContentLength: aws.Int64(info.Size()),
+			})
 		}
-
-		err = writer.WriteField("fileId", fileId)
-
+		_ = file.Close()
 		if err != nil {
-			return fmt.Errorf("error writing fileId field: %w", err)
+			return fmt.Errorf("upload HLS chunk %q: %w", entry.Name(), err)
 		}
-
-		part, err := writer.CreateFormFile("file", file.Name())
-
-		if err != nil {
-			return fmt.Errorf("error creating form file part: %w", err)
-		}
-
-		_, err = part.Write(fileToUpload)
-
-		if err != nil {
-			return fmt.Errorf("error writing file content to form part: %w", err)
-		}
-
-		err = writer.Close()
-
-		if err != nil {
-			return fmt.Errorf("error closing multipart writer: %w", err)
-		}
-
-		request, err := http.NewRequest(http.MethodPost, uploadRequestURL, &requestBody)
-		if err != nil {
-			return fmt.Errorf("error creating request: %w", err)
-		}
-
-		request.Header.Set("Content-Type", writer.FormDataContentType())
-		request.Header.Set("X-Appwrite-Response-Format", config.AppConfig.AppwriteResponseFormat)
-		request.Header.Set("X-Appwrite-Project", config.AppConfig.AppwriteProjectID)
-		request.Header.Set("X-Appwrite-Key", config.AppConfig.AppwriteKey)
-
-		client := &http.Client{}
-
-		response, err := client.Do(request)
-		if err != nil {
-			return fmt.Errorf("error sending request to Appwrite: %w", err)
-		}
-		defer response.Body.Close()
-
-		if response.StatusCode != 201 {
-			body, err := io.ReadAll(response.Body)
-			if err != nil {
-				return fmt.Errorf("error reading response body: %w", err)
-			}
-			videoProcessing.Error("error uploading segment to Appwrite Storage", "status_code", response.StatusCode, "response_body", string(body), "file_name", file.Name())
-		} else {
-			count = idx
-			err = os.Remove("segments/" + folderName + "/" + file.Name())
-			if err != nil {
-				return fmt.Errorf("error removing segment file after upload: %w", err)
-			}
+		if err := os.Remove(filePath); err != nil {
+			return fmt.Errorf("remove local HLS chunk: %w", err)
 		}
 	}
-
-	if count == len(files)-1 {
-		err = os.Remove("segments/" + folderName)
-		if err != nil {
-			return fmt.Errorf("error removing segments directory after upload: %w", err)
+	if err := os.Remove(hlsDirectory); err != nil {
+		return fmt.Errorf("remove local HLS directory: %w", err)
+	}
+	manifestPath := filepath.Join(config.AppConfig.RootPath, storagekeys.ManifestsFolder, videoID+".m3u8")
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("open HLS manifest: %w", err)
+	}
+	manifestLines := strings.Split(string(manifest), "\n")
+	for index, line := range manifestLines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			manifestLines[index] = "/video/" + videoID + "/stream/" + filepath.Base(trimmed)
 		}
 	}
-
+	manifest = []byte(strings.Join(manifestLines, "\n"))
+	if !videoProcessingActive(ctx, db, videoID) {
+		return context.Canceled
+	}
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(config.AppConfig.AppwriteBucketID), Key: aws.String(storagekeys.Manifest(videoID)),
+		ContentType: aws.String("application/vnd.apple.mpegurl"), Body: strings.NewReader(string(manifest)), ContentLength: aws.Int64(int64(len(manifest))),
+	})
+	if err != nil {
+		return fmt.Errorf("upload HLS manifest: %w", err)
+	}
+	if err := os.Remove(manifestPath); err != nil {
+		return fmt.Errorf("remove local HLS manifest: %w", err)
+	}
+	videoProcessing.Info("HLS chunks and manifest uploaded to S3 storage", "video_id", videoID)
 	return nil
+}
+
+func deleteHLSAssetsFromStorage(ctx context.Context, client *s3.Client, videoID string) error {
+	var cleanupErr error
+	bucket := aws.String(config.AppConfig.AppwriteBucketID)
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: bucket, Prefix: aws.String(storagekeys.HLSChunkPrefix(videoID)),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("list HLS chunks for rollback: %w", err))
+			break
+		}
+		for _, object := range page.Contents {
+			if object.Key == nil {
+				continue
+			}
+			if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: bucket, Key: object.Key}); err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete HLS chunk %q during rollback: %w", *object.Key, err))
+			}
+		}
+	}
+	if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: bucket, Key: aws.String(storagekeys.Manifest(videoID))}); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete HLS manifest during rollback: %w", err))
+	}
+	return cleanupErr
 }
 
 func closeAndRemoveTmpfile(tmpFile *os.File) (errClose, errRemove error) {
@@ -337,28 +338,54 @@ func closeAndRemoveTmpfile(tmpFile *os.File) (errClose, errRemove error) {
 	return nil, nil
 }
 
-func PostUploadProcessFile(serverFileName string, fileName string, videoTitle string, tmpFile *os.File, db *sql.DB, userID types.UserID) {
-	videoProcessing = logger.Log.With("video_id", fileName)
+func videoProcessingActive(ctx context.Context, db *sql.DB, videoID string) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var active bool
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM videos WHERE video_id=$1 AND delete_flag=0)`, videoID).Scan(&active); err != nil {
+		return false
+	}
+	return active
+}
+
+func PostUploadProcessFile(ctx context.Context, serverFileName string, fileName string, videoTitle string, tmpFile *os.File, db *sql.DB, userID types.UserID) {
+	videoProcessing := logger.Log.With("video_id", fileName)
 
 	videoProcessing.Info("processing video")
 
-	extractedThumbnail, err := extractThumbnail(("./video/" + serverFileName), fileName)
+	extractedThumbnail, err := extractThumbnail(ctx, ("./video/" + serverFileName), fileName)
 	thumbnailURL := ""
 
 	if err != nil {
+		if !videoProcessingActive(ctx, db, fileName) {
+			return
+		}
 		videoProcessing.Error("error extracting thumbnail for video", "error", err)
 	} else {
-		videoProcessing.Debug("extracted thumbnail for video", "thumbnail", extractedThumbnail)
-		thumbnailURL, err = uploadThumbnailToAppwrite(fileName, db)
-		if err != nil {
-			videoProcessing.Error("error uploading thumbnail to appwrite Storage", "error", err)
+		if !videoProcessingActive(ctx, db, fileName) {
+			return
 		}
-		videoProcessing.Info("uploaded thumbnail to appwrite Storage", "thumbnail_url", thumbnailURL)
+		videoProcessing.Debug("extracted thumbnail for video", "thumbnail", extractedThumbnail)
+		thumbnailURL, err = uploadThumbnailToStorage(ctx, fileName, db)
+		if err != nil {
+			if !videoProcessingActive(ctx, db, fileName) {
+				return
+			}
+			videoProcessing.Error("error uploading thumbnail to storage", "error", err)
+		}
+		videoProcessing.Info("uploaded thumbnail to storage", "thumbnail_url", thumbnailURL)
 	}
 
-	err = breakFile(("./video/" + serverFileName), fileName)
+	if !videoProcessingActive(ctx, db, fileName) {
+		return
+	}
+	err = breakFile(ctx, ("./video/" + serverFileName), fileName, db)
 
 	if err != nil {
+		if !videoProcessingActive(ctx, db, fileName) {
+			return
+		}
 		videoProcessing.Error("error breaking file into segments", "error", err)
 		if err := UpdateVideoStatus(db, fileName, types.ProcessingFailed); err != nil {
 			videoProcessing.Error("error updating upload status for video in DB", "error", err)
@@ -372,9 +399,15 @@ func PostUploadProcessFile(serverFileName string, fileName string, videoTitle st
 	}
 
 	videoProcessing.Info("broken file into segments")
+	if !videoProcessingActive(ctx, db, fileName) {
+		return
+	}
 
 	errClose, errRemove := closeAndRemoveTmpfile(tmpFile)
 	if errClose != nil {
+		if !videoProcessingActive(ctx, db, fileName) {
+			return
+		}
 		videoProcessing.Error("error closing temporary file", "error", err)
 		if err := UpdateVideoStatus(db, fileName, types.ProcessingFailed); err != nil {
 			log.Printf("Error updating upload status for video %s in DB: %v", fileName, err)
@@ -391,9 +424,15 @@ func PostUploadProcessFile(serverFileName string, fileName string, videoTitle st
 		videoProcessing.Warn("error removing temporary file", "error", err)
 	}
 
-	err = uploadToAppwrite(fileName)
+	if !videoProcessingActive(ctx, db, fileName) {
+		return
+	}
+	err = uploadHLSAssetsToStorage(ctx, fileName, db)
 	if err != nil {
-		videoProcessing.Error("error uploading segments to Appwrite Storage", "error", err)
+		if !videoProcessingActive(ctx, db, fileName) {
+			return
+		}
+		videoProcessing.Error("error uploading HLS assets to storage", "error", err)
 		if err := UpdateVideoStatus(db, fileName, types.ProcessingFailed); err != nil {
 			videoProcessing.Error("error updating upload status for video in DB", "error", err)
 		}
@@ -406,7 +445,10 @@ func PostUploadProcessFile(serverFileName string, fileName string, videoTitle st
 		return
 	}
 
-	videoProcessing.Info("uploaded segments to appwrite storage")
+	videoProcessing.Info("uploaded HLS assets to storage")
+	if !videoProcessingActive(ctx, db, fileName) {
+		return
+	}
 	if err := UpdateVideoStatus(db, fileName, types.ProcessingCompleted); err != nil {
 		videoProcessing.Error("error updating upload status for video in DB", "error", err)
 	}
@@ -418,174 +460,94 @@ func PostUploadProcessFile(serverFileName string, fileName string, videoTitle st
 	})
 }
 
-func GetManifestFile(w http.ResponseWriter, videoId string) ([]byte, error) {
-
-	getManifestFile := "https://cloud.appwrite.io/v1/storage/buckets/" + config.AppConfig.AppwriteBucketID + "/files/" + videoId + "/view"
-
-	request, err := http.NewRequest(http.MethodGet, getManifestFile, nil)
-
+func GetStorageObjectBytes(key string) ([]byte, error) {
+	object, err := storage.GetObject(context.Background(), config.AppConfig.AppwriteBucketID, key)
 	if err != nil {
-		return nil, fmt.Errorf("error creating request to get manifest file: %w", err)
+		return nil, err
 	}
-
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Appwrite-Response-Format", config.AppConfig.AppwriteResponseFormat)
-	request.Header.Set("X-Appwrite-Project", config.AppConfig.AppwriteProjectID)
-	request.Header.Set("X-Appwrite-Key", config.AppConfig.AppwriteKey)
-
-	client := &http.Client{}
-
-	response, err := client.Do(request)
-
-	if err != nil {
-		return nil, fmt.Errorf("error sending request to get manifest file: %w", err)
-	}
-
-	defer response.Body.Close()
-
-	// TODO: util function should not handle HTTP status codes
-	if response.StatusCode == 404 {
-		SendError(w, http.StatusNotFound, "Manifest file not found")
-		return nil, fmt.Errorf("manifest file not found for video ID: %s", videoId)
-	}
-
-	bodyBytes, err := io.ReadAll(response.Body)
-
-	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %w", err)
-	}
-
-	return bodyBytes, nil
+	defer object.Body.Close()
+	return io.ReadAll(object.Body)
 }
 
-func GetFileId(fileName string) string {
-	hashChecksum := sha1.New()
-	hashChecksum.Write([]byte(fileName))
-	fileId := fmt.Sprintf("%x", hashChecksum.Sum(nil))[:36]
-
-	return fileId
+func GetManifestFile(_ http.ResponseWriter, videoID string) ([]byte, error) {
+	return GetStorageObjectBytes(storagekeys.Manifest(videoID))
 }
 
-func DeleteVideo(w http.ResponseWriter, r *http.Request, db *sql.DB, videoId string) {
-	// TODO: Use SSEs here
-	deleteLogger := logger.Log.With("video_id", videoId)
-	fileBytes, err := GetManifestFile(w, videoId)
-
+func DeleteVideo(w http.ResponseWriter, _ *http.Request, db *sql.DB, videoID string) {
+	deleteLogger := logger.Log.With("video_id", videoID)
+	lockConn, err := lockVideoDeletion(context.Background(), db, videoID)
 	if err != nil {
-		deleteLogger.Error("Error getting manifest file", "error", err)
+		deleteLogger.Error("failed to coordinate video deletion with processing", "error", err)
+		SendError(w, http.StatusInternalServerError, "Error deleting video files")
+		return
+	}
+	defer unlockVideo(lockConn, videoID)
+
+	var rawObjectKey string
+	if err := db.QueryRow(`SELECT source_file_key FROM videos WHERE video_id=$1`, videoID).Scan(&rawObjectKey); err != nil {
+		deleteLogger.Error("failed to read source object key", "error", err)
 		SendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
-
-	file := string(fileBytes)
-	lines := strings.Split(file, "\n")
-
-	deleteUrl := "https://cloud.appwrite.io/v1/storage/buckets/" + config.AppConfig.AppwriteBucketID + "/files/"
-
-	thumbnailFile := videoId + "_thumbnail.png"
-
-	thumbnailFileName := strings.Split(thumbnailFile, ".")[0]
-
-	thumbnailFileId := GetFileId(thumbnailFileName)
-
-	request, err := http.NewRequest(http.MethodDelete, deleteUrl+thumbnailFileId, nil)
-
+	client, err := storage.NewS3Client(context.Background())
 	if err != nil {
-		deleteLogger.Error("Error creating request to delete thumbnail", "error", err)
+		deleteLogger.Error("failed to create S3 client", "error", err)
 		SendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
-
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Appwrite-Response-Format", config.AppConfig.AppwriteResponseFormat)
-	request.Header.Set("X-Appwrite-Project", config.AppConfig.AppwriteProjectID)
-	request.Header.Set("X-Appwrite-Key", config.AppConfig.AppwriteKey)
-
-	client := &http.Client{}
-
-	response, err := client.Do(request)
-	if err != nil {
-		deleteLogger.Error("Error deleting thumbnail file", "error", err)
-		SendError(w, http.StatusInternalServerError, "Error Deleting Thumbnail")
-		return
-	}
-	defer response.Body.Close()
-
-	for i := 0; i < len(lines); i++ {
-		if strings.HasSuffix(lines[i], ".ts") {
-			fileName := strings.Split(lines[i], ".")[0]
-			fileId := GetFileId(fileName)
-
-			request, err := http.NewRequest(http.MethodDelete, deleteUrl+fileId, nil)
-
-			if err != nil {
-				deleteLogger.Error("Error creating request to delete chunk", "error", err)
-				SendError(w, http.StatusInternalServerError, "Internal Server Error")
-				return
-			}
-
-			request.Header.Set("Content-Type", "application/json")
-			request.Header.Set("X-Appwrite-Response-Format", config.AppConfig.AppwriteResponseFormat)
-			request.Header.Set("X-Appwrite-Project", config.AppConfig.AppwriteProjectID)
-			request.Header.Set("X-Appwrite-Key", config.AppConfig.AppwriteKey)
-
-			client := &http.Client{}
-
-			response, err := client.Do(request)
-			if err != nil {
-				deleteLogger.Error("Error deleting chunk file", "error", err)
-				SendError(w, http.StatusInternalServerError, "Internal Server Error")
-				return
-			}
-			defer response.Body.Close()
+	bucket := config.AppConfig.AppwriteBucketID
+	keys := []string{rawObjectKey, storagekeys.Manifest(videoID), storagekeys.Thumbnail(videoID)}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, err := client.DeleteObject(context.Background(), &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}); err != nil {
+			deleteLogger.Error("failed to delete S3 object", "object_key", key, "error", err)
+			SendError(w, http.StatusInternalServerError, "Error deleting video files")
+			return
 		}
 	}
-
-	deleteLogger.Info("deleted all .ts files")
-
-	request, err = http.NewRequest(http.MethodDelete, deleteUrl+videoId, nil)
-
-	if err != nil {
-		deleteLogger.Error("error creating request to delete manifest file", "error", err)
+	chunkPrefix := storagekeys.HLSChunkPrefix(videoID)
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String(chunkPrefix)})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(context.Background())
+		if err != nil {
+			deleteLogger.Error("failed to list HLS chunks", "error", err)
+			SendError(w, http.StatusInternalServerError, "Error deleting video files")
+			return
+		}
+		for _, object := range page.Contents {
+			if object.Key == nil {
+				continue
+			}
+			if _, err := client.DeleteObject(context.Background(), &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: object.Key}); err != nil {
+				deleteLogger.Error("failed to delete HLS chunk", "object_key", *object.Key, "error", err)
+				SendError(w, http.StatusInternalServerError, "Error deleting video files")
+				return
+			}
+		}
+	}
+	localPaths := []string{
+		filepath.Join(config.AppConfig.RootPath, storagekeys.HLSChunksFolder, videoID),
+		filepath.Join(config.AppConfig.RootPath, storagekeys.ManifestsFolder, videoID+".m3u8"),
+		filepath.Join(config.AppConfig.RootPath, storagekeys.ThumbnailsFolder, videoID+".png"),
+	}
+	if rawObjectKey != "" {
+		localPaths = append(localPaths, filepath.Join("./video", filepath.Base(rawObjectKey)))
+	}
+	for _, path := range localPaths {
+		if err := os.RemoveAll(path); err != nil {
+			deleteLogger.Error("failed to remove local video processing asset", "path", path, "error", err)
+			SendError(w, http.StatusInternalServerError, "Error deleting video files")
+			return
+		}
+	}
+	if _, err := db.Exec(`DELETE FROM videos WHERE video_id=$1`, videoID); err != nil {
+		deleteLogger.Error("failed to delete database record", "error", err)
 		SendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
-
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Appwrite-Response-Format", config.AppConfig.AppwriteResponseFormat)
-	request.Header.Set("X-Appwrite-Project", config.AppConfig.AppwriteProjectID)
-	request.Header.Set("X-Appwrite-Key", config.AppConfig.AppwriteKey)
-
-	client = &http.Client{}
-
-	response, err = client.Do(request)
-	if err != nil {
-		deleteLogger.Error("error deleting manifest file", "error", err)
-		SendError(w, http.StatusInternalServerError, "Internal Server Error")
-		return
-	}
-	defer response.Body.Close()
-
-	deleteLogger.Info("deleted .m3u8 file")
-
-	query, err := db.Prepare(`DELETE FROM videos WHERE video_id=$1`)
-
-	if err != nil {
-		deleteLogger.Error("error preparing delete query", "error", err)
-		SendError(w, http.StatusInternalServerError, "Internal Server Error")
-		return
-	}
-
-	_, err = query.Exec(videoId)
-
-	if err != nil {
-		deleteLogger.Error("error executing delete query", "error", err)
-		SendError(w, http.StatusInternalServerError, "Internal Server Error")
-		return
-	}
-
-	deleteLogger.Info("deleted database record")
-	deleteLogger.Info("video deleted successfully", "video_id", videoId)
+	deleteLogger.Info("video and its storage objects deleted")
 }
 
 func GenerateJWT(userID string, username string) (string, error) {
@@ -656,9 +618,10 @@ func GetUserFromRequest(r *http.Request) (*types.User, error) {
 	return nil, nil
 }
 
-func extractMetaData(videoPath string) (*types.FFProbeOutput, error) {
-	cmd := exec.Command("ffprobe",
+func extractMetaData(ctx context.Context, videoPath string) (*types.FFProbeOutput, error) {
+	cmd := exec.CommandContext(ctx, "ffprobe",
 		"-v", "error",
+		"-protocol_whitelist", "file",
 		"-show_entries", "stream=codec_name,codec_type",
 		"-show_entries", "format=filename,duration,bit_rate,size",
 		"-of", "json",
@@ -703,7 +666,7 @@ func handleProcessingCompletedStatus(db *sql.DB, videoID string) error {
 	query = `
 			UPDATE videos
 			SET status = $1, upload_end_time = $2
-			WHERE video_id = $3;
+			WHERE video_id = $3 AND delete_flag = 0;
 		`
 	result, err = db.Exec(query, types.ProcessingCompleted, time.Now(), videoID)
 
@@ -731,7 +694,7 @@ func updateGenericVideoStatus(db *sql.DB, videoID string, status types.VideoStat
 	query = `
 			UPDATE videos
 			SET status = $1
-			WHERE video_id = $2;
+			WHERE video_id = $2 AND delete_flag = 0;
 		`
 	result, err = db.Exec(query, status, videoID)
 

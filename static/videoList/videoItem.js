@@ -695,7 +695,7 @@ class VideoItem extends HTMLElement {
     if (name === "thumbnail") {
       const element = this.shadow.querySelector(".thumbnail");
       if (element) {
-        element.src = newValue || "";
+        element.src = newValue && newValue.startsWith("/") ? `${window.ENV.API_URL}${newValue}` : newValue || "";
       }
     } else if (name === "name") {
       const element = this.shadow.querySelector(".content .name");

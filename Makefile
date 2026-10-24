@@ -19,13 +19,17 @@ install-dev:
 	fi
 	@echo "Checking for Go installation..."
 	@if command -v go > /dev/null 2>&1; then \
-		echo "Go is already installed."; \
+		go_version=$$(go env GOVERSION | sed 's/^go//'); \
+		if ! awk -F. -v version="$$go_version" 'BEGIN { split(version, v, "."); if (v[1]+0 > 1 || (v[1]+0 == 1 && (v[2]+0 > 27 || (v[2]+0 == 27 && v[3]+0 >= 3)))) exit 0; exit 1 }'; then \
+			echo "Go 1.27.3 or newer is required; found go$$go_version. Upgrade Go and rerun make install-dev."; exit 1; \
+		fi; \
+		echo "Go $$go_version is installed."; \
 	else \
-		echo "Installing Go version 1.23.7..."; \
-		wget https://golang.org/dl/go1.23.7.linux-amd64.tar.gz -O go1.23.7.tar.gz || exit 1; \
-		sudo tar -C /usr/local -xzf go1.23.7.tar.gz || exit 1; \
-		echo "Go version 1.23.7 installed."; \
-		rm go1.23.7.tar.gz; \
+		echo "Installing Go version 1.27.3..."; \
+		wget https://golang.org/dl/go1.27.3.linux-amd64.tar.gz -O go1.27.3.tar.gz || exit 1; \
+		sudo tar -C /usr/local -xzf go1.27.3.tar.gz || exit 1; \
+		echo "Go version 1.27.3 installed."; \
+		rm go1.27.3.tar.gz; \
 		echo "Updating PATH to include Go binary directory..."; \
 		echo "export PATH=\$$PATH:/usr/local/go/bin" >> ~/.bashrc; \
 		export PATH=$PATH:$(go env GOPATH)/bin \
@@ -54,13 +58,17 @@ install-dev:
 install-prod:
 	@echo "Checking for Go installation..."
 	@if command -v go > /dev/null 2>&1; then \
-		echo "Go is already installed."; \
+		go_version=$$(go env GOVERSION | sed 's/^go//'); \
+		if ! awk -F. -v version="$$go_version" 'BEGIN { split(version, v, "."); if (v[1]+0 > 1 || (v[1]+0 == 1 && (v[2]+0 > 27 || (v[2]+0 == 27 && v[3]+0 >= 3)))) exit 0; exit 1 }'; then \
+			echo "Go 1.27.3 or newer is required; found go$$go_version. Upgrade Go and rerun make install-prod."; exit 1; \
+		fi; \
+		echo "Go $$go_version is installed."; \
 	else \
-		echo "Installing Go version 1.22.2..."; \
-		wget https://golang.org/dl/go1.22.2.linux-amd64.tar.gz -O go1.22.2.tar.gz || exit 1; \
-		sudo tar -C /usr/local -xzf go1.22.2.tar.gz || exit 1; \
-		echo "Go version 1.22.2 installed."; \
-		rm go1.22.2.tar.gz; \
+		echo "Installing Go version 1.27.3..."; \
+		wget https://golang.org/dl/go1.27.3.linux-amd64.tar.gz -O go1.27.3.tar.gz || exit 1; \
+		sudo tar -C /usr/local -xzf go1.27.3.tar.gz || exit 1; \
+		echo "Go version 1.27.3 installed."; \
+		rm go1.27.3.tar.gz; \
 		echo "Updating PATH to include Go binary directory..."; \
 		echo "export PATH=\$$PATH:/usr/local/go/bin" >> ~/.bashrc; \
 		. ~/.bashrc; \
@@ -89,13 +97,16 @@ clean:
 	@echo "Cleaning up directories and files..."
 	@if [ -d "video" ]; then rm -r video; fi
 	@if [ -d "segments" ]; then rm -r segments; fi
+	@if [ -d "hls_chunks" ]; then rm -r hls_chunks; fi
+	@if [ -d "manifests" ]; then rm -r manifests; fi
 	@if [ -d "thumbnails" ]; then rm -r thumbnails; fi
 	@echo "Clean up complete."
 
 init:
 	@echo "Initializing directories..."
 	@mkdir -p video
-	@mkdir -p segments
+	@mkdir -p hls_chunks
+	@mkdir -p manifests
 	@mkdir -p thumbnails
 	@echo "Initialization complete."
 

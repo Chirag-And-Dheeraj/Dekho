@@ -1,11 +1,11 @@
 package main
 
 import (
-	"log/slog"
 	"encoding/json"
 	"fmt"
 	"html"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"os"
 	"regexp"
@@ -33,6 +33,16 @@ import (
 func videoHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	method := r.Method
+	if method == http.MethodGet {
+		if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/stream/?$`, path); matched {
+			controllers.ManifestFileHandler(w, r)
+			return
+		}
+		if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/stream/[a-zA-Z0-9_-]+\.ts/?$`, path); matched {
+			controllers.TSFileHandler(w, r)
+			return
+		}
+	}
 	db, err := database.GetDBConn()
 
 	if err != nil {
@@ -42,16 +52,22 @@ func videoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if method == http.MethodPost {
-		controllers.UploadVideo(w, r, db)
+		if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/abort/?$`, path); matched {
+			controllers.AbortVideoUpload(w, r, db)
+		} else if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/complete/?$`, path); matched {
+			controllers.CompleteVideoUpload(w, r, db)
+		} else if path == "/video/" {
+			controllers.CreateVideoUpload(w, r, db)
+		} else {
+			utils.SendError(w, http.StatusNotFound, "Not Found")
+		}
 	} else if method == http.MethodGet {
 		if path == "/video/" {
 			controllers.GetVideos(w, r, db)
+		} else if matched, err := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/thumbnail/?$`, path); err == nil && matched {
+			controllers.ThumbnailHandler(w, r, db)
 		} else if matched, err := regexp.MatchString("^/video/[a-zA-B0-9-]+/?$", path); err == nil && matched {
 			controllers.GetVideo(w, r, db)
-		} else if matched, err := regexp.MatchString("^/video/[a-zA-B0-9-]+/stream/?$", path); err == nil && matched {
-			controllers.ManifestFileHandler(w, r, db)
-		} else if matched, err := regexp.MatchString("^/video/[a-zA-B0-9-]+/stream/[a-zA-B0-9_-]+.ts/?$", r.URL.Path); err == nil && matched {
-			controllers.TSFileHandler(w, r, db)
 		} else {
 			response := fmt.Sprintf("Error: handler for %s not found", html.EscapeString(r.URL.Path))
 			http.Error(w, response, http.StatusNotFound)
@@ -313,6 +329,12 @@ func main() {
 	}
 
 	logger.Init(config.AppConfig.Debug)
+	cleanupDB, dbErr := database.GetDBConn()
+	if dbErr != nil {
+		slog.Error("Failed to connect to database", "error", dbErr)
+		os.Exit(1)
+	}
+	controllers.StartAbandonedUploadCleanup(cleanupDB)
 	setUpRoutes()
 	logger.Log.Info(
 		"Dekho server is listening on",
