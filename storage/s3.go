@@ -32,23 +32,49 @@ func NewS3Client(ctx context.Context) (*s3.Client, error) {
 	}), nil
 }
 
-func PresignPut(ctx context.Context, bucket, key, contentType string) (string, error) {
+const MultipartPartSize int64 = 10 * 1024 * 1024
+
+func CreateMultipartUpload(ctx context.Context, bucket, key, contentType string) (string, error) {
 	client, err := NewS3Client(ctx)
 	if err != nil {
 		return "", err
 	}
-	presigner := s3.NewPresignClient(client)
-	request, err := presigner.PresignPutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(bucket),
-		Key:         aws.String(key),
-		ContentType: aws.String(contentType),
-	}, func(options *s3.PresignOptions) {
-		options.Expires = 15 * time.Minute
+	result, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), ContentType: aws.String(contentType),
 	})
 	if err != nil {
-		return "", fmt.Errorf("presign S3 upload: %w", err)
+		return "", fmt.Errorf("create S3 multipart upload: %w", err)
+	}
+	if result.UploadId == nil || *result.UploadId == "" {
+		return "", fmt.Errorf("create S3 multipart upload: empty upload ID")
+	}
+	return *result.UploadId, nil
+}
+
+func PresignUploadPart(ctx context.Context, bucket, key, uploadID string, partNumber int32) (string, error) {
+	client, err := NewS3Client(ctx)
+	if err != nil {
+		return "", err
+	}
+	request, err := s3.NewPresignClient(client).PresignUploadPart(ctx, &s3.UploadPartInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(partNumber),
+	}, func(options *s3.PresignOptions) {
+		options.Expires = 2 * time.Hour
+	})
+	if err != nil {
+		return "", fmt.Errorf("presign S3 upload part: %w", err)
 	}
 	return request.URL, nil
+}
+
+func AbortMultipartUpload(ctx context.Context, client *s3.Client, bucket, key, uploadID string) error {
+	_, err := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+	})
+	if err != nil {
+		return fmt.Errorf("abort S3 multipart upload: %w", err)
+	}
+	return nil
 }
 
 func PresignGet(ctx context.Context, bucket, key string) (string, error) {

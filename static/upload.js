@@ -11,6 +11,7 @@ const progressContainer = document.getElementById("progressContainer");
 const progressBar = document.getElementById("progressBar");
 
 let uploadInProgress = false;
+let uploadInProgressVideoID = null;
 
 function handleBeforeUnload(event) {
   if (!uploadInProgress) return;
@@ -29,22 +30,72 @@ function checkFileType(file) {
   return true;
 }
 
-function uploadToStorage(url, file, onProgress) {
+async function responseError(response, fallback) {
+  try {
+    const body = await response.json();
+    if (body.error) return body.error;
+  } catch (_) {
+    // Use a status-based message if the response isn't JSON.
+  }
+  return `${fallback} (HTTP ${response.status})`;
+}
+
+function uploadPartToStorage(url, part, onProgress) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     request.open("PUT", url);
-    request.setRequestHeader("Content-Type", file.type);
     request.upload.addEventListener("progress", (event) => {
-      if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+      if (event.lengthComputable) onProgress(event.loaded);
     });
     request.addEventListener("load", () => {
-      if (request.status >= 200 && request.status < 300) resolve();
-      else reject(new Error(`Storage upload failed (${request.status})`));
+      if (request.status >= 200 && request.status < 300) {
+        const etag = request.getResponseHeader("ETag");
+        if (etag) resolve(etag);
+        else reject(new Error("File upload failed. Check the file and its size, then try again later."));
+      }
+      else if (request.status === 413) reject(new Error("File too large."));
+      else reject(new Error("File upload failed. Check the file and its size, then try again later."));
     });
-    request.addEventListener("error", () => reject(new Error("Storage upload failed. Check your connection and try again.")));
+    request.addEventListener("error", () => reject(new Error("File upload failed. Check the file and its size, then try again later.")));
     request.addEventListener("abort", () => reject(new Error("Upload was cancelled.")));
-    request.send(file);
+    request.send(part);
   });
+}
+
+async function uploadMultipart(videoID, file, partSize, parts) {
+  const maxParallelParts = 5;
+  const loadedByPart = new Array(parts.length).fill(0);
+  const uploadedParts = [];
+
+  for (let offset = 0; offset < parts.length; offset += maxParallelParts) {
+    const batch = parts.slice(offset, offset + maxParallelParts);
+    const results = await Promise.allSettled(batch.map(async ({ part_number: partNumber, upload_url: uploadURL }) => {
+      const start = (partNumber - 1) * partSize;
+      const part = file.slice(start, Math.min(start + partSize, file.size));
+      const etag = await uploadPartToStorage(uploadURL, part, (loaded) => {
+        loadedByPart[partNumber - 1] = loaded;
+        const uploadedBytes = loadedByPart.reduce((total, bytes) => total + bytes, 0);
+        const percentage = Math.min(Math.round((uploadedBytes / file.size) * 100), 99);
+        progressBar.style.width = `${percentage}%`;
+        divOutput.textContent = `${percentage}%`;
+      });
+      loadedByPart[partNumber - 1] = part.size;
+      return { part_number: partNumber, etag };
+    }));
+    const failedUpload = results.find((result) => result.status === "rejected");
+    if (failedUpload) throw failedUpload.reason;
+    uploadedParts.push(...results.map((result) => result.value));
+  }
+
+  uploadedParts.sort((a, b) => a.part_number - b.part_number);
+
+  divOutput.textContent = "99%";
+  const completeResponse = await fetch(`${window.ENV.API_URL}/video/${encodeURIComponent(videoID)}/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ parts: uploadedParts }),
+  });
+  if (!completeResponse.ok) throw new Error(await responseError(completeResponse, "Unable to complete upload"));
 }
 
 fileForm.addEventListener("submit", async (event) => {
@@ -60,7 +111,7 @@ fileForm.addEventListener("submit", async (event) => {
   if (!checkFileType(file)) return;
   const sizeLimit = Number(localStorage.getItem("FILE_SIZE_LIMIT"));
   if (sizeLimit && file.size > sizeLimit) {
-    fileError.textContent = `File size is greater than ${sizeLimit / (1024 * 1024)} MB`;
+    fileError.textContent = "File too large.";
     fileError.style.display = "block";
     return;
   }
@@ -81,26 +132,29 @@ fileForm.addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title, description, file_name: file.name, file_size: file.size, content_type: file.type }),
     });
-    if (!createResponse.ok) throw new Error(await createResponse.text() || "Unable to start upload");
-    const { video_id: videoID, upload_url: uploadURL } = await createResponse.json();
-
-    divOutput.textContent = "Uploading directly to storage...";
-    await uploadToStorage(uploadURL, file, (progress) => {
-      progressBar.style.width = `${progress}%`;
-      divOutput.textContent = `${progress}%`;
-    });
-
-    divOutput.textContent = "Confirming upload...";
-    const completeResponse = await fetch(`${window.ENV.API_URL}/video/${videoID}/complete`, { method: "POST" });
-    if (!completeResponse.ok) throw new Error(await completeResponse.text() || "Unable to confirm upload");
+    if (!createResponse.ok) {
+      const message = await responseError(createResponse, "Unable to start upload");
+      throw new Error(/size exceeds|too large/i.test(message) ? "File too large." : message);
+    }
+    const { video_id: videoID, part_size: partSize, parts } = await createResponse.json();
+    uploadInProgressVideoID = videoID;
+    await uploadMultipart(videoID, file, partSize, parts);
 
     progressBar.style.width = "100%";
     divOutput.textContent = "Upload complete! Your video is processing. Redirecting to your videos...";
     window.setTimeout(() => { window.location.href = "/list"; }, 2500);
   } catch (error) {
+    if (uploadInProgressVideoID) {
+      try {
+        await fetch(`${window.ENV.API_URL}/video/${encodeURIComponent(uploadInProgressVideoID)}/abort`, { method: "POST" });
+      } catch (abortError) {
+        console.warn("Unable to clean up incomplete upload", abortError);
+      }
+    }
     divOutput.textContent = error.message || "Upload failed. Please try again.";
     uploadVideoButton.disabled = false;
   } finally {
+    uploadInProgressVideoID = null;
     uploadInProgress = false;
     window.removeEventListener("beforeunload", handleBeforeUnload);
   }

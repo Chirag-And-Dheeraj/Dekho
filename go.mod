@@ -1,6 +1,6 @@
 module video-streaming-server
 
-go 1.27.0
+go 1.27.3
 
 require (
 	github.com/air-verse/air v1.61.7

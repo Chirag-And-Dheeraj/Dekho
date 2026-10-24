@@ -332,6 +332,7 @@ func DeleteHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		utils.SendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
+	utils.CancelVideoProcessing(videoId)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)

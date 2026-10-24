@@ -52,7 +52,9 @@ func videoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if method == http.MethodPost {
-		if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/complete/?$`, path); matched {
+		if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/abort/?$`, path); matched {
+			controllers.AbortVideoUpload(w, r, db)
+		} else if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/complete/?$`, path); matched {
 			controllers.CompleteVideoUpload(w, r, db)
 		} else if path == "/video/" {
 			controllers.CreateVideoUpload(w, r, db)
@@ -327,6 +329,12 @@ func main() {
 	}
 
 	logger.Init(config.AppConfig.Debug)
+	cleanupDB, dbErr := database.GetDBConn()
+	if dbErr != nil {
+		slog.Error("Failed to connect to database", "error", dbErr)
+		os.Exit(1)
+	}
+	controllers.StartAbandonedUploadCleanup(cleanupDB)
 	setUpRoutes()
 	logger.Log.Info(
 		"Dekho server is listening on",

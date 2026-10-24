@@ -22,6 +22,8 @@ Dekho is a research and study project aimed at understanding and learning about 
 - Create an **_[Appwrite storage bucket](https://appwrite.io/docs/products/storage)_**
   - Make sure that you make a note of `APPWRITE_KEY`, `APPWRITE_PROJECT_ID` and the `BUCKET_ID`.
   - Set `APPWRITE_S3_ENDPOINT` to the project's regional S3 endpoint (for example, `https://fra.cloud.appwrite.io/v1/s3`) and `APPWRITE_S3_REGION` to `auto` or the Appwrite region code. The API key needs the `buckets.read`, `buckets.write`, `files.read`, and `files.write` scopes.
+  - Browser uploads send cross-origin `PUT` requests to this S3 endpoint, which require an `OPTIONS` preflight. Appwrite's S3 API allows browser requests from any origin by default and does not implement per-bucket CORS settings, so no Appwrite bucket CORS setup is needed. If you put a proxy in front of the endpoint or use a self-hosted deployment with different CORS behavior, allow `OPTIONS` and `PUT`, permit the request's `Content-Type` header, and expose the `ETag` response header to the browser.
+  - Uploads not completed within 24 hours are automatically removed, including their multipart data and any source object. Cleanup runs every 15 minutes while the server is running.
 
 ### With Docker
 
@@ -34,7 +36,7 @@ Dekho is a research and study project aimed at understanding and learning about 
 
 - Install the `make` utility because we have created a **_[Makefile](Makefile)_** to ease the setup
 - Now we are moving to the dependency installation steps.
-- This project needs `go version go1.23`, `ffmpeg` utility and `psql (PostgreSQL) 16.3` database.
+- This project needs Go 1.27.3 or newer, the `ffmpeg` utility, and a `psql` (PostgreSQL) 16.3 database.
 - To install these, and the Go dependencies, run `make install-dev`.
   - The `make install-dev` takes care of installing PostgreSQL, Go, FFMpeg, golang-migrate and Go dependencies.
   - Run `make start-postgres` to start the postgres service.
