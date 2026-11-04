@@ -19,6 +19,8 @@ func CreateNewSSEChannel(refererPath string, bufferSize int) types.SSEChannel {
 
 func InitializeSSEConnection(userID types.UserID, path string) types.SessionID {
 	sessionID := types.SessionID(uuid.New().String())
+	shared.SSEConnectionsMutex.Lock()
+	defer shared.SSEConnectionsMutex.Unlock()
 	userSSEChannelMap, userExists := shared.GlobalUserSSEConnectionsMap[userID]
 	if !userExists {
 		logger.Log.Debug("user not found in GlobalUserSSEConnectionsMap, creating new entry", "userID", userID)
@@ -32,6 +34,8 @@ func InitializeSSEConnection(userID types.UserID, path string) types.SessionID {
 }
 
 func RemoveSSEConnection(userID types.UserID, sessionID types.SessionID) {
+	shared.SSEConnectionsMutex.Lock()
+	defer shared.SSEConnectionsMutex.Unlock()
 	userSSEChannelMap, userExists := shared.GlobalUserSSEConnectionsMap[userID]
 	if !userExists {
 		logger.Log.Error("user not found in GlobalUserSSEConnectionsMap", "userID", userID)

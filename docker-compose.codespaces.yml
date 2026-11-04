@@ -1,0 +1,39 @@
+services:
+  dekho:
+    network_mode: host
+    ports: !reset []
+    environment:
+      DB_HOST: 127.0.0.1
+      PORT: "18000"
+      REDIS_ADDR: 127.0.0.1:6379
+      API_INSTANCE_ID: dekho-api
+    extra_hosts: !reset []
+
+  dekho-worker:
+    network_mode: host
+    extra_hosts: !reset []
+    environment:
+      DB_HOST: 127.0.0.1
+      SSL_MODE: disable
+      REDIS_ADDR: 127.0.0.1:6379
+
+  asynqmon:
+    network_mode: host
+    ports: !reset []
+    environment:
+      PORT: "8081"
+      REDIS_ADDR: 127.0.0.1:6379
+    depends_on:
+      dekho-redis:
+        condition: service_healthy
+
+  dekho-port-proxy:
+    image: nginx:alpine
+    depends_on:
+      - dekho
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${PORT}:80"
+    volumes:
+      - ./docker/nginx.codespaces.conf:/etc/nginx/conf.d/default.conf:ro

@@ -6,15 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"video-streaming-server/config"
+	"video-streaming-server/queueing"
 	"video-streaming-server/shared/logger"
 	"video-streaming-server/storage"
 	"video-streaming-server/storagekeys"
@@ -26,6 +25,7 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
+	"github.com/hibiken/asynq"
 )
 
 const (
@@ -66,7 +66,10 @@ func CreateVideoUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		utils.SendError(w, http.StatusBadRequest, "Invalid upload request")
 		return
 	}
-	if strings.TrimSpace(input.Title) == "" || input.FileSize <= 0 || filepath.Base(input.FileName) != input.FileName || input.FileName == "" {
+	missingTitle := strings.TrimSpace(input.Title) == ""
+	invalidFileSize := input.FileSize <= 0
+	invalidFileName := input.FileName == "" || filepath.Base(input.FileName) != input.FileName
+	if missingTitle || invalidFileSize || invalidFileName {
 		utils.SendError(w, http.StatusBadRequest, "Title, valid file name, and positive file size are required")
 		return
 	}
@@ -108,7 +111,7 @@ func CreateVideoUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		utils.SendError(w, http.StatusInternalServerError, "Unable to prepare video upload")
 		return
 	}
-	_, err = db.Exec(`INSERT INTO videos (video_id,title,description,upload_initiate_time,status,delete_flag,user_id,source_file_key,source_file_size,source_upload_id) VALUES ($1,$2,$3,$4,$5,0,$6,$7,$8,$9)`, videoID, input.Title, input.Description, time.Now(), types.UploadPending, user.ID, key, input.FileSize, uploadID)
+	_, err = db.Exec(`INSERT INTO videos (video_id,title,description,upload_initiate_time,status,delete_flag,user_id,source_file_key,source_file_size,source_upload_id,video_source) VALUES ($1,$2,$3,$4,$5,0,$6,$7,$8,$9,$10)`, videoID, input.Title, input.Description, time.Now(), types.UploadPending, user.ID, key, input.FileSize, uploadID, types.VideoSourceUploadForm)
 	if err != nil {
 		logger.Log.Error("failed to create video record", "error", err)
 		if client, clientErr := storage.NewS3Client(r.Context()); clientErr == nil {
@@ -215,7 +218,7 @@ func cleanupAbandonedUploads(db *sql.DB) {
 		logger.Log.Error("failed to find abandoned uploads", "error", err)
 		return
 	}
-	var videoIDs []string
+	videoIDs := []string{}
 	for rows.Next() {
 		var videoID string
 		if err := rows.Scan(&videoID); err != nil {
@@ -278,7 +281,7 @@ func cleanupAbandonedUpload(db *sql.DB, videoID string, cutoff time.Time) error 
 	return nil
 }
 
-func CompleteVideoUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+func CompleteVideoUpload(w http.ResponseWriter, r *http.Request, db *sql.DB, queueClient *asynq.Client) {
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	videoID := strings.TrimSuffix(strings.TrimPrefix(path, "/video/"), "/complete")
 	user, err := utils.GetUserFromRequest(r)
@@ -298,6 +301,13 @@ func CompleteVideoUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 	if currentStatus != types.UploadPending {
+		if currentStatus == types.UploadedOnServer {
+			if err := enqueueVideoProcessing(r.Context(), queueClient, videoID); err != nil {
+				logger.Log.Error("failed to enqueue video processing retry", "video_id", videoID, "error", err)
+				utils.SendError(w, http.StatusServiceUnavailable, "Video was uploaded but processing could not be queued")
+				return
+			}
+		}
 		writeUploadAccepted(w)
 		return
 	}
@@ -437,8 +447,12 @@ func CompleteVideoUpload(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		utils.SendError(w, http.StatusConflict, "Upload has already been confirmed")
 		return
 	}
+	if err := enqueueVideoProcessing(r.Context(), queueClient, videoID); err != nil {
+		logger.Log.Error("failed to enqueue video processing", "video_id", videoID, "error", err)
+		utils.SendError(w, http.StatusServiceUnavailable, "Upload was confirmed but processing could not be queued; retry this request")
+		return
+	}
 	writeUploadAccepted(w)
-	go downloadAndProcessVideo(context.Background(), client, key, videoID, title, db, types.UserID(user.ID))
 }
 
 func writeUploadAccepted(w http.ResponseWriter) {
@@ -446,64 +460,19 @@ func writeUploadAccepted(w http.ResponseWriter) {
 	_, _ = w.Write([]byte("Video upload confirmed and processing started"))
 }
 
-func downloadAndProcessVideo(ctx context.Context, client *s3.Client, key, videoID, title string, db *sql.DB, userID types.UserID) {
-	ctx, finishProcessing, err := utils.BeginVideoProcessing(ctx, db, videoID)
+func enqueueVideoProcessing(ctx context.Context, client *asynq.Client, videoID string) error {
+	task, err := queueing.NewProcessVideoTask(videoID)
 	if err != nil {
-		logger.Log.Info("video processing skipped", "video_id", videoID, "error", err)
-		return
+		return err
 	}
-	defer finishProcessing()
-
-	object, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(config.AppConfig.AppwriteBucketID), Key: aws.String(key)})
-	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		logger.Log.Error("failed to download source from S3 storage", "video_id", videoID, "error", err)
-		_ = utils.UpdateVideoStatus(db, videoID, types.ProcessingFailed)
-		return
+	_, err = client.EnqueueContext(ctx, task, queueing.ProcessVideoTaskOptions(
+		config.AppConfig.VideoTaskMaxRetries,
+		config.AppConfig.VideoTaskTimeout,
+		config.AppConfig.VideoTaskRetention,
+		config.AppConfig.VideoTaskUniqueTTL,
+	)...)
+	if errors.Is(err, asynq.ErrDuplicateTask) {
+		return nil
 	}
-	defer object.Body.Close()
-	if err := os.MkdirAll("./video", 0755); err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		logger.Log.Error("failed to prepare video directory", "error", err)
-		_ = utils.UpdateVideoStatus(db, videoID, types.ProcessingFailed)
-		return
-	}
-	tmpFile, err := os.Create(filepath.Join("./video", filepath.Base(key)))
-	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		logger.Log.Error("failed to create local source file", "error", err)
-		_ = utils.UpdateVideoStatus(db, videoID, types.ProcessingFailed)
-		return
-	}
-	defer func() {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
-	}()
-	if _, err = io.Copy(tmpFile, object.Body); err != nil {
-		logger.Log.Error("failed to download source", "error", err)
-		tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
-		if ctx.Err() != nil {
-			return
-		}
-		_ = utils.UpdateVideoStatus(db, videoID, types.ProcessingFailed)
-		return
-	}
-	if _, err = tmpFile.Seek(0, io.SeekStart); err != nil {
-		logger.Log.Error("failed to rewind source", "error", err)
-		tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
-		if ctx.Err() != nil {
-			return
-		}
-		_ = utils.UpdateVideoStatus(db, videoID, types.ProcessingFailed)
-		return
-	}
-	utils.PostUploadProcessFile(ctx, filepath.Base(key), videoID, title, tmpFile, db, userID)
+	return err
 }

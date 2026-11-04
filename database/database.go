@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"video-streaming-server/config"
 	"video-streaming-server/shared/logger"
-
-	_ "github.com/lib/pq"
 )
 
 var DB *sql.DB
@@ -67,4 +65,10 @@ func GetDBConn() (*sql.DB, error) {
 		}
 	}
 	return DB, nil
+}
+
+func ConnectionString() string {
+	dbConfig, _ := newDBConfig()
+	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		dbConfig.Host, dbConfig.Port, dbConfig.User, dbConfig.Password, dbConfig.Name, dbConfig.SSLMode)
 }

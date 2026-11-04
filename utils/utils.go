@@ -20,7 +20,6 @@ import (
 	"video-streaming-server/config"
 	"video-streaming-server/database"
 	"video-streaming-server/repositories"
-	"video-streaming-server/shared"
 	"video-streaming-server/shared/logger"
 	"video-streaming-server/storage"
 	"video-streaming-server/storagekeys"
@@ -349,115 +348,61 @@ func videoProcessingActive(ctx context.Context, db *sql.DB, videoID string) bool
 	return active
 }
 
-func PostUploadProcessFile(ctx context.Context, serverFileName string, fileName string, videoTitle string, tmpFile *os.File, db *sql.DB, userID types.UserID) {
-	videoProcessing := logger.Log.With("video_id", fileName)
+type PostUploadProcessFileOptions struct {
+	SourcePath string
+	VideoID    string
+	DB         *sql.DB
+}
 
+type ProcessingOutput struct {
+	ThumbnailURL string
+}
+
+func PostUploadProcessFile(ctx context.Context, options PostUploadProcessFileOptions) (ProcessingOutput, error) {
+	videoID := options.VideoID
+	db := options.DB
+	videoProcessing := logger.Log.With("video_id", videoID)
 	videoProcessing.Info("processing video")
+	output := ProcessingOutput{}
 
-	extractedThumbnail, err := extractThumbnail(ctx, ("./video/" + serverFileName), fileName)
-	thumbnailURL := ""
-
-	if err != nil {
-		if !videoProcessingActive(ctx, db, fileName) {
-			return
+	if thumbnailPath, err := extractThumbnail(ctx, options.SourcePath, videoID); err != nil {
+		if !videoProcessingActive(ctx, db, videoID) {
+			return output, context.Canceled
 		}
-		videoProcessing.Error("error extracting thumbnail for video", "error", err)
+		videoProcessing.Warn("error extracting thumbnail for video", "error", err)
 	} else {
-		if !videoProcessingActive(ctx, db, fileName) {
-			return
-		}
-		videoProcessing.Debug("extracted thumbnail for video", "thumbnail", extractedThumbnail)
-		thumbnailURL, err = uploadThumbnailToStorage(ctx, fileName, db)
+		videoProcessing.Debug("extracted thumbnail for video", "thumbnail", thumbnailPath)
+		output.ThumbnailURL, err = uploadThumbnailToStorage(ctx, videoID, db)
 		if err != nil {
-			if !videoProcessingActive(ctx, db, fileName) {
-				return
+			if !videoProcessingActive(ctx, db, videoID) {
+				return output, context.Canceled
 			}
-			videoProcessing.Error("error uploading thumbnail to storage", "error", err)
+			videoProcessing.Warn("error uploading thumbnail to storage", "error", err)
+			output.ThumbnailURL = ""
 		}
-		videoProcessing.Info("uploaded thumbnail to storage", "thumbnail_url", thumbnailURL)
 	}
 
-	if !videoProcessingActive(ctx, db, fileName) {
-		return
+	if !videoProcessingActive(ctx, db, videoID) {
+		return output, context.Canceled
 	}
-	err = breakFile(ctx, ("./video/" + serverFileName), fileName, db)
-
-	if err != nil {
-		if !videoProcessingActive(ctx, db, fileName) {
-			return
+	if err := breakFile(ctx, options.SourcePath, videoID, db); err != nil {
+		if !videoProcessingActive(ctx, db, videoID) {
+			return output, context.Canceled
 		}
-		videoProcessing.Error("error breaking file into segments", "error", err)
-		if err := UpdateVideoStatus(db, fileName, types.ProcessingFailed); err != nil {
-			videoProcessing.Error("error updating upload status for video in DB", "error", err)
-		}
-		shared.SendEventToUser(userID, "video_status", types.VideoResponseType{
-			ID:     fileName,
-			Title:  videoTitle,
-			Status: types.ProcessingFailed,
-		})
-		return
+		return output, fmt.Errorf("break file into HLS segments: %w", err)
 	}
-
 	videoProcessing.Info("broken file into segments")
-	if !videoProcessingActive(ctx, db, fileName) {
-		return
+	if !videoProcessingActive(ctx, db, videoID) {
+		return output, context.Canceled
 	}
-
-	errClose, errRemove := closeAndRemoveTmpfile(tmpFile)
-	if errClose != nil {
-		if !videoProcessingActive(ctx, db, fileName) {
-			return
+	if err := uploadHLSAssetsToStorage(ctx, videoID, db); err != nil {
+		if !videoProcessingActive(ctx, db, videoID) {
+			return output, context.Canceled
 		}
-		videoProcessing.Error("error closing temporary file", "error", err)
-		if err := UpdateVideoStatus(db, fileName, types.ProcessingFailed); err != nil {
-			log.Printf("Error updating upload status for video %s in DB: %v", fileName, err)
-		}
-		shared.SendEventToUser(userID, "video_status", types.VideoResponseType{
-			ID:     fileName,
-			Title:  videoTitle,
-			Status: types.ProcessingFailed,
-		})
-		return
+		return output, fmt.Errorf("upload HLS assets: %w", err)
 	}
-
-	if errRemove != nil {
-		videoProcessing.Warn("error removing temporary file", "error", err)
-	}
-
-	if !videoProcessingActive(ctx, db, fileName) {
-		return
-	}
-	err = uploadHLSAssetsToStorage(ctx, fileName, db)
-	if err != nil {
-		if !videoProcessingActive(ctx, db, fileName) {
-			return
-		}
-		videoProcessing.Error("error uploading HLS assets to storage", "error", err)
-		if err := UpdateVideoStatus(db, fileName, types.ProcessingFailed); err != nil {
-			videoProcessing.Error("error updating upload status for video in DB", "error", err)
-		}
-
-		shared.SendEventToUser(userID, "video_status", types.VideoResponseType{
-			ID:     fileName,
-			Title:  videoTitle,
-			Status: types.ProcessingFailed,
-		})
-		return
-	}
-
 	videoProcessing.Info("uploaded HLS assets to storage")
-	if !videoProcessingActive(ctx, db, fileName) {
-		return
-	}
-	if err := UpdateVideoStatus(db, fileName, types.ProcessingCompleted); err != nil {
-		videoProcessing.Error("error updating upload status for video in DB", "error", err)
-	}
-	shared.SendEventToUser(userID, "video_status", types.VideoResponseType{
-		ID:        fileName,
-		Title:     videoTitle,
-		Status:    types.ProcessingCompleted,
-		Thumbnail: thumbnailURL,
-	})
+	return output, nil
 }
 
 func GetStorageObjectBytes(key string) ([]byte, error) {
@@ -623,7 +568,7 @@ func extractMetaData(ctx context.Context, videoPath string) (*types.FFProbeOutpu
 		"-v", "error",
 		"-protocol_whitelist", "file",
 		"-show_entries", "stream=codec_name,codec_type",
-		"-show_entries", "format=filename,duration,bit_rate,size",
+		"-show_entries", "format=filename,format_name,duration,bit_rate,size",
 		"-of", "json",
 		videoPath,
 	)
@@ -640,6 +585,10 @@ func extractMetaData(ctx context.Context, videoPath string) (*types.FFProbeOutpu
 	}
 
 	return &ffprobeOutput, nil
+}
+
+func ProbeVideoMetadata(ctx context.Context, videoPath string) (*types.FFProbeOutput, error) {
+	return extractMetaData(ctx, videoPath)
 }
 
 func SendError(w http.ResponseWriter, statusCode int, message string) {

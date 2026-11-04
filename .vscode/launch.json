@@ -1,0 +1,62 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Dekho logs: PostgreSQL",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "docker compose -f docker-compose.yml -f docker-compose.codespaces.yml logs --follow --tail=100 dekho-postgres",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Dekho logs: Redis",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "docker compose -f docker-compose.yml -f docker-compose.codespaces.yml logs --follow --tail=100 dekho-redis",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Dekho logs: Asynqmon",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "docker compose -f docker-compose.yml -f docker-compose.codespaces.yml logs --follow --tail=100 asynqmon",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Dekho logs: API",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "docker compose -f docker-compose.yml -f docker-compose.codespaces.yml logs --follow --tail=100 dekho",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Dekho logs: Worker",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "docker compose -f docker-compose.yml -f docker-compose.codespaces.yml logs --follow --tail=100 dekho-worker",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Dekho logs: Codespaces proxy",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "docker compose -f docker-compose.yml -f docker-compose.codespaces.yml logs --follow --tail=100 dekho-port-proxy",
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Dekho: All services (separate terminals)",
+      "configurations": [
+        "Dekho logs: PostgreSQL",
+        "Dekho logs: Redis",
+        "Dekho logs: Asynqmon",
+        "Dekho logs: API",
+        "Dekho logs: Worker",
+        "Dekho logs: Codespaces proxy"
+      ],
+      "preLaunchTask": "Dekho: Start Compose stack (Codespaces)",
+      "stopAll": true
+    }
+  ]
+}

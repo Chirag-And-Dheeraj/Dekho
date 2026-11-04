@@ -95,6 +95,7 @@ install-prod:
 
 clean:
 	@echo "Cleaning up directories and files..."
+	@if [ -d "bin" ]; then rm -r bin; fi
 	@if [ -d "video" ]; then rm -r video; fi
 	@if [ -d "segments" ]; then rm -r segments; fi
 	@if [ -d "hls_chunks" ]; then rm -r hls_chunks; fi
@@ -130,7 +131,16 @@ start:
 	make start-postgres || exit 1
 	make migrate-up || exit 1
 	@echo "Starting the Go application..."
-	go run main.go
+	go run .
+
+start-worker:
+	go run ./cmd/worker
+
+start-redis:
+	docker compose up -d dekho-redis
+
+start-asynqmon:
+	docker compose up -d asynqmon
 
 cleanstart:
 	@echo "Performing clean start..."
@@ -139,7 +149,9 @@ cleanstart:
 	make start || exit 1
 
 build:
-	go build main.go
+	@mkdir -p bin
+	go build -o bin/dekho-api .
+	go build -o bin/dekho-worker ./cmd/worker
 
 migration:
 	migrate create -ext sql -dir $(pwd)/database/migrations -seq $(name)
@@ -150,3 +162,9 @@ migrate-up:
 
 migrate-down:
 	migrate -path $(pwd)/database/migrations -database "postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}?sslmode=${SSL_MODE}" down $(down)
+
+run-codespaces-up:
+	docker compose -f docker-compose.yml -f docker-compose.codespaces.yml up --build
+
+run-codespaces-down:
+	docker compose -f docker-compose.yml -f docker-compose.codespaces.yml down

@@ -1,24 +1,36 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"html/template"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
+	"syscall"
 	"time"
+
+	"github.com/hibiken/asynq"
+	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
+
 	"video-streaming-server/config"
 	"video-streaming-server/controllers"
 	"video-streaming-server/database"
 	mw "video-streaming-server/middleware"
+	"video-streaming-server/queueing"
 	"video-streaming-server/repositories"
 	"video-streaming-server/services"
 	"video-streaming-server/shared"
 	"video-streaming-server/shared/logger"
 	"video-streaming-server/sse"
+	"video-streaming-server/statusbus"
 	"video-streaming-server/types"
 	"video-streaming-server/utils"
 )
@@ -30,7 +42,7 @@ import (
 /video/[id]/stream/[filename] - Get The Segment of Video
 */
 
-func videoHandler(w http.ResponseWriter, r *http.Request) {
+func videoHandler(w http.ResponseWriter, r *http.Request, queueClient *asynq.Client) {
 	path := r.URL.Path
 	method := r.Method
 	if method == http.MethodGet {
@@ -55,7 +67,7 @@ func videoHandler(w http.ResponseWriter, r *http.Request) {
 		if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/abort/?$`, path); matched {
 			controllers.AbortVideoUpload(w, r, db)
 		} else if matched, _ := regexp.MatchString(`^/video/[a-zA-Z0-9-]+/complete/?$`, path); matched {
-			controllers.CompleteVideoUpload(w, r, db)
+			controllers.CompleteVideoUpload(w, r, db, queueClient)
 		} else if path == "/video/" {
 			controllers.CreateVideoUpload(w, r, db)
 		} else {
@@ -263,8 +275,6 @@ func serverSentEventsHandler(w http.ResponseWriter, r *http.Request) {
 	// defer sachMeDeferWaleFunctionsReturnKePehleExecuteHoteHainTestingFunction()
 	defer sse.RemoveSSEConnection(userID, sessionID)
 
-	utils.PrettyPrintMap(shared.GlobalUserSSEConnectionsMap, "GlobalUserSSEConnectionsMap")
-
 	logger.Log.Info("user connected to the event stream", "user id", userID, "session id", sessionID)
 
 	disconnected := r.Context().Done()
@@ -273,15 +283,21 @@ func serverSentEventsHandler(w http.ResponseWriter, r *http.Request) {
 	// the intent behind this flush is for an initial connection heartbeat
 	rc.Flush()
 
-	channel := shared.GlobalUserSSEConnectionsMap[userID].Sessions[sessionID].EventChannel
+	channel, ok := shared.GetSSEChannel(userID, sessionID)
+	if !ok {
+		logger.Log.Error("SSE session channel disappeared during setup", "user_id", userID, "session_id", sessionID)
+		return
+	}
 
 	for {
 		select {
 		case <-disconnected:
 			logger.Log.Info("user disconnected from event stream", "user id", userID, "session id", sessionID)
-			utils.PrettyPrintMap(shared.GlobalUserSSEConnectionsMap, "GlobalUserSSEConnectionsMap")
 			return
-		case rawMessage := <-channel:
+		case rawMessage, open := <-channel.EventChannel:
+			if !open {
+				return
+			}
 
 			message := rawMessage
 			event := message.Event
@@ -292,9 +308,14 @@ func serverSentEventsHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			logger.Log.Debug("sending event data to user on session", "event", event, "event data", eventData, "user id", userID, "session id", sessionID)
-			if n, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, eventData); err != nil {
+			frame := ""
+			if message.ID != "" {
+				frame = fmt.Sprintf("id: %s\n", message.ID)
+			}
+			frame += fmt.Sprintf("event: %s\ndata: %s\n\n", event, eventData)
+			if n, err := fmt.Fprint(w, frame); err != nil {
 				logger.Log.Error("failed to send event data to user on session", "event", event, "event data", eventData, "user id", userID, "session id", sessionID, "error", err)
-				utils.SendError(w, http.StatusInternalServerError, "Internal Server Error")
+				return
 			} else {
 				logger.Log.Info("sent event data to user on session", "event", event, "event data", eventData, "user id", userID, "session id", sessionID, "bytes written", n)
 			}
@@ -304,7 +325,7 @@ func serverSentEventsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func setUpRoutes() {
+func setUpRoutes(queueClient *asynq.Client) {
 	logger.Log.Debug("setting up routes")
 	http.HandleFunc("/", utils.Chain(homePageHandler, mw.Logging))
 	http.HandleFunc("/register", utils.Chain(registerPageHandler, mw.Logging))
@@ -314,7 +335,9 @@ func setUpRoutes() {
 	http.HandleFunc("/list", utils.Chain(listPageHandler, mw.Logging, mw.AuthRequired))
 	http.HandleFunc("/watch", utils.Chain(watchPageHandler, mw.Logging, mw.AuthRequired))
 	http.HandleFunc("/config", configHandler)
-	http.HandleFunc("/video/", utils.Chain(videoHandler, mw.Logging, mw.AuthRequired))
+	http.HandleFunc("/video/", utils.Chain(func(w http.ResponseWriter, r *http.Request) {
+		videoHandler(w, r, queueClient)
+	}, mw.Logging, mw.AuthRequired))
 	http.HandleFunc("/server-events/", utils.Chain(serverSentEventsHandler, mw.Logging, mw.AuthRequired))
 
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
@@ -329,21 +352,114 @@ func main() {
 	}
 
 	logger.Init(config.AppConfig.Debug)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	cleanupDB, dbErr := database.GetDBConn()
 	if dbErr != nil {
 		slog.Error("Failed to connect to database", "error", dbErr)
 		os.Exit(1)
 	}
+	defer cleanupDB.Close()
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: config.AppConfig.RedisAddr, Password: config.AppConfig.RedisPassword, DB: config.AppConfig.RedisDB,
+	})
+	redisCtx, redisCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := redisClient.Ping(redisCtx).Err(); err != nil {
+		redisCancel()
+		slog.Error("Failed to connect to Redis", "error", err)
+		os.Exit(1)
+	}
+	redisCancel()
+	defer redisClient.Close()
+	asynqClient := asynq.NewClient(asynq.RedisClientOpt{
+		Addr: config.AppConfig.RedisAddr, Password: config.AppConfig.RedisPassword, DB: config.AppConfig.RedisDB,
+	})
+	defer asynqClient.Close()
+	bus, err := statusbus.New(cleanupDB, redisClient)
+	if err != nil {
+		slog.Error("Failed to initialize status event bus", "error", err)
+		os.Exit(1)
+	}
+	go func() {
+		if err := bus.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Log.Error("status event bus stopped", "error", err)
+		}
+	}()
+	go reconcileVideoProcessingQueue(ctx, cleanupDB, asynqClient)
 	controllers.StartAbandonedUploadCleanup(cleanupDB)
-	setUpRoutes()
+	setUpRoutes(asynqClient)
 	logger.Log.Info(
 		"Dekho server is listening on",
 		"address", config.AppConfig.Addr,
 		"port", config.AppConfig.Port,
 	)
-	err := http.ListenAndServe(fmt.Sprintf("%s:%s", config.AppConfig.Addr, config.AppConfig.Port), nil)
-	if err != nil {
-		slog.Error("server failed to start", "error", err)
-		os.Exit(1)
+	server := &http.Server{Addr: fmt.Sprintf("%s:%s", config.AppConfig.Addr, config.AppConfig.Port), Handler: http.DefaultServeMux}
+	serverErrors := make(chan error, 1)
+	go func() { serverErrors <- server.ListenAndServe() }()
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Log.Error("failed to gracefully stop API server", "error", err)
+		}
+	case err := <-serverErrors:
+		if err != nil && err != http.ErrServerClosed {
+			slog.Error("server failed to start", "error", err)
+			os.Exit(1)
+		}
+	}
+}
+
+func reconcileVideoProcessingQueue(ctx context.Context, db *sql.DB, client *asynq.Client) {
+	enqueuePending := func() {
+		for offset := 0; ; offset += 100 {
+			rows, err := db.QueryContext(ctx, `SELECT video_id FROM videos WHERE status=$1 AND delete_flag=0 ORDER BY upload_end_time NULLS FIRST,video_id LIMIT 100 OFFSET $2`, types.UploadedOnServer, offset)
+			if err != nil {
+				logger.Log.Error("failed to find videos needing processing enqueue", "error", err)
+				return
+			}
+			count := 0
+			for rows.Next() {
+				count++
+				var videoID string
+				if err := rows.Scan(&videoID); err != nil {
+					logger.Log.Error("failed to read video needing processing enqueue", "error", err)
+					continue
+				}
+				task, err := queueing.NewProcessVideoTask(videoID)
+				if err == nil {
+					_, err = client.EnqueueContext(ctx, task, queueing.ProcessVideoTaskOptions(
+						config.AppConfig.VideoTaskMaxRetries,
+						config.AppConfig.VideoTaskTimeout,
+						config.AppConfig.VideoTaskRetention,
+						config.AppConfig.VideoTaskUniqueTTL,
+					)...)
+				}
+				if err != nil && !errors.Is(err, asynq.ErrDuplicateTask) {
+					logger.Log.Error("failed to enqueue pending video", "video_id", videoID, "error", err)
+				}
+			}
+			rowsErr := rows.Err()
+			_ = rows.Close()
+			if rowsErr != nil {
+				logger.Log.Error("failed to iterate videos needing processing enqueue", "error", rowsErr)
+				return
+			}
+			if count < 100 {
+				return
+			}
+		}
+	}
+	enqueuePending()
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			enqueuePending()
+		}
 	}
 }

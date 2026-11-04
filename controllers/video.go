@@ -9,7 +9,7 @@ import (
 	"video-streaming-server/shared/logger"
 	"video-streaming-server/storage"
 	"video-streaming-server/storagekeys"
-	. "video-streaming-server/types"
+	"video-streaming-server/types"
 	"video-streaming-server/utils"
 )
 
@@ -30,7 +30,15 @@ func GetVideos(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			title,
 			description,
 			thumbnail,
-			status
+			status,
+			duration_seconds,
+			original_video_codec::text,
+			original_audio_codec::text,
+			original_container::text,
+			final_video_codec::text,
+			final_audio_codec::text,
+			final_container::text,
+			video_source::text
 		FROM
 			videos
 		WHERE
@@ -59,16 +67,19 @@ func GetVideos(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	defer rows.Close()
 
-	records := make([]VideoResponseType, 0)
+	records := make([]types.VideoResponseType, 0)
 
 	for rows.Next() {
 		var id string
 		var title string
 		var description string
 		var thumbnail sql.NullString
-		var status VideoStatus
+		var status types.VideoStatus
+		var metadata videoMetadataColumns
 
-		err := rows.Scan(&id, &title, &description, &thumbnail, &status)
+		err := rows.Scan(&id, &title, &description, &thumbnail, &status,
+			&metadata.duration, &metadata.originalVideo, &metadata.originalAudio, &metadata.originalContainer,
+			&metadata.finalVideo, &metadata.finalAudio, &metadata.finalContainer, &metadata.source)
 
 		if err != nil {
 			logger.Log.Error("failed to scan row", "error", err)
@@ -81,13 +92,14 @@ func GetVideos(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			thumbValue = thumbnail.String
 		}
 
-		record := VideoResponseType{
+		record := types.VideoResponseType{
 			ID:          id,
 			Title:       title,
 			Description: description,
 			Thumbnail:   thumbValue,
 			Status:      status,
 		}
+		applyVideoMetadata(&record, metadata)
 
 		records = append(records, record)
 	}
@@ -120,7 +132,9 @@ func GetVideo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	detailsQuery, err := db.Prepare(`
 		SELECT
-			title, description
+			title,description,thumbnail,status,duration_seconds,
+			original_video_codec::text,original_audio_codec::text,original_container::text,
+			final_video_codec::text,final_audio_codec::text,final_container::text,video_source::text
 		FROM
 			videos
 		WHERE
@@ -138,7 +152,12 @@ func GetVideo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	defer detailsQuery.Close()
 
 	var title, description string
-	err = detailsQuery.QueryRow(videoId, user.ID).Scan(&title, &description)
+	var thumbnail sql.NullString
+	var status types.VideoStatus
+	var metadata videoMetadataColumns
+	err = detailsQuery.QueryRow(videoId, user.ID).Scan(&title, &description, &thumbnail, &status,
+		&metadata.duration, &metadata.originalVideo, &metadata.originalAudio, &metadata.originalContainer,
+		&metadata.finalVideo, &metadata.finalAudio, &metadata.finalContainer, &metadata.source)
 
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -151,11 +170,16 @@ func GetVideo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	videoDetails := &Video{
+	videoDetails := &types.VideoResponseType{
 		ID:          videoId,
 		Title:       title,
 		Description: description,
+		Status:      status,
 	}
+	if thumbnail.Valid {
+		videoDetails.Thumbnail = thumbnail.String
+	}
+	applyVideoMetadata(videoDetails, metadata)
 	videoDetailsJSON, err := json.Marshal(videoDetails)
 
 	if err != nil {
@@ -167,6 +191,43 @@ func GetVideo(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(videoDetailsJSON))
+}
+
+type videoMetadataColumns struct {
+	duration          sql.NullFloat64
+	originalVideo     sql.NullString
+	originalAudio     sql.NullString
+	originalContainer sql.NullString
+	finalVideo        sql.NullString
+	finalAudio        sql.NullString
+	finalContainer    sql.NullString
+	source            string
+}
+
+func applyVideoMetadata(response *types.VideoResponseType, metadata videoMetadataColumns) {
+	if metadata.duration.Valid {
+		value := metadata.duration.Float64
+		response.DurationSeconds = &value
+	}
+	if metadata.originalVideo.Valid {
+		response.OriginalVideoCodec = types.VideoCodec(metadata.originalVideo.String)
+	}
+	if metadata.originalAudio.Valid {
+		response.OriginalAudioCodec = types.AudioCodec(metadata.originalAudio.String)
+	}
+	if metadata.originalContainer.Valid {
+		response.OriginalContainer = types.VideoContainer(metadata.originalContainer.String)
+	}
+	if metadata.finalVideo.Valid {
+		response.FinalVideoCodec = types.VideoCodec(metadata.finalVideo.String)
+	}
+	if metadata.finalAudio.Valid {
+		response.FinalAudioCodec = types.AudioCodec(metadata.finalAudio.String)
+	}
+	if metadata.finalContainer.Valid {
+		response.FinalContainer = types.VideoContainer(metadata.finalContainer.String)
+	}
+	response.VideoSource = types.VideoSource(metadata.source)
 }
 
 // @desc Get Manifest File
@@ -255,7 +316,7 @@ func UpdateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	var reqBody UpdateRequest
+	var reqBody types.UpdateRequest
 	err = json.NewDecoder(r.Body).Decode(&reqBody)
 	if err != nil {
 		logger.Log.Warn("failed to get user from request", "error", err)

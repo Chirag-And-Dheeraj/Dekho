@@ -10,15 +10,13 @@ var (
 )
 
 func Init(debug bool) {
-	var handler slog.Handler
+	handler := slog.Handler(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level:     slog.LevelInfo,
+		AddSource: true,
+	}))
 	if debug {
 		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 			Level:     slog.LevelDebug,
-			AddSource: true,
-		})
-	} else {
-		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level:     slog.LevelInfo,
 			AddSource: true,
 		})
 	}
