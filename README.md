@@ -28,6 +28,16 @@ Dekho is a research and study project aimed at understanding and learning about 
 - Docker Compose starts Redis with persistent storage and a read-only Asynqmon UI at `http://localhost:8081` (configurable with `ASYNQMON_PORT`; read-only mode uses `ASYNQMON_READ_ONLY`, default `true`). Successfully completed video tasks are retained in Redis for 24 hours so they remain visible in Asynqmon. Asynq's default successful-task retention is zero, which deletes tasks on completion. The UI binds to localhost by default; for hosted deployments, expose it only through an authenticated access path.
 - Asynq task settings are configurable in `.env`: `VIDEO_TASK_MAX_RETRIES` (default `5`), `VIDEO_TASK_TIMEOUT` (`6h`), `VIDEO_TASK_RETENTION` (`24h`), `VIDEO_TASK_UNIQUE_TTL` (`24h`), `WORKER_CONCURRENCY` (`2`), and `WORKER_SHUTDOWN_TIMEOUT` (`2m`). Use Go duration syntax for duration values; set retention to `0s` to remove completed tasks immediately or unique TTL to `0s` to disable enqueue deduplication. Asynqmon is the monitoring UI; retries, processing timeouts, and task retention are Asynq settings.
 
+### Render POC deployment
+
+`render.yaml` describes the API, the Asynq worker hosted as a free Render Web Service, and an authenticated, read-only Asynqmon Web Service. Redis and PostgreSQL remain external managed services: use the Neon connection URL for `DATABASE_URL` and the Upstash TCP/TLS URL (`rediss://...`) for `REDIS_URL`. The shared Go packages are compiled into the API, worker, and Asynqmon binaries; each Render service uses its own Dockerfile and image.
+
+Before syncing the Blueprint, change the `dekho-api` service name in `render.yaml` to exactly match the name of the API Web Service that already exists in your Render workspace. This lets Render update that service rather than create a duplicate. Render prompts for the database, Redis, Appwrite, JWT, and Asynqmon credentials during the initial Blueprint setup. If the API is not currently using the JWT secret you enter, existing login cookies will be invalidated.
+
+The worker exposes `GET /healthz` on Render's `PORT` while running the Asynq server in the same process. `WORKER_CONCURRENCY` defaults to `1` in the Render Blueprint to limit load on the free instance. The deployment intentionally does not include a keep-alive process; run that outside this repository while using the POC. The free Render services can still be restarted at any time, so Redis queue persistence and the API's pending-video reconciliation remain important.
+
+Asynqmon is read-only and protected by HTTP Basic Auth (`ASYNQMON_USER` and `ASYNQMON_PASSWORD`). Keep those credentials private. For the locally hosted worker health endpoint, use `WORKER_HEALTH_PORT` (default `8082` in `.env.local`).
+
 ### With Docker
 
 - Install `docker-compose` on your machine.

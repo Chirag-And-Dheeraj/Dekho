@@ -74,7 +74,7 @@ func (b *Bus) Run(ctx context.Context) error {
 		return fmt.Errorf("create status stream consumer group: %w", err)
 	}
 	wake := make(chan struct{}, 1)
-	listener := pq.NewListener(database.ConnectionString(), 2*time.Second, 30*time.Second, func(event pq.ListenerEventType, err error) {
+	listener := pq.NewListener(database.ListenerConnectionString(), 2*time.Second, 30*time.Second, func(event pq.ListenerEventType, err error) {
 		if event == pq.ListenerEventReconnected {
 			slog.Info("reconnected to PostgreSQL outbox notifications")
 			select {

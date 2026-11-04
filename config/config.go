@@ -34,6 +34,8 @@ type Config struct {
 	DBUser                 string
 	DBPassword             string
 	DBName                 string
+	DatabaseURL            string
+	RedisURL               string
 	RedisAddr              string
 	RedisPassword          string
 	RedisDB                int
@@ -97,12 +99,18 @@ func LoadEnvFile(filename string) error {
 
 func LoadConfig(envFile string) error {
 	if err := LoadEnvFile(envFile); err != nil {
-		return err
+		if !os.IsNotExist(err) {
+			return err
+		}
 	}
 
-	debug, err := strconv.ParseBool(os.Getenv("DEBUG"))
-	if err != nil {
-		return fmt.Errorf("error parsing DEBUG environment variable: %w", err)
+	debug := false
+	var err error
+	if value := os.Getenv("DEBUG"); value != "" {
+		debug, err = strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("error parsing DEBUG environment variable: %w", err)
+		}
 	}
 	redisDB := 0
 	if value := os.Getenv("REDIS_DB"); value != "" {
@@ -158,6 +166,8 @@ func LoadConfig(envFile string) error {
 		DBUser:                 os.Getenv("DB_USER"),
 		DBPassword:             os.Getenv("DB_PASSWORD"),
 		DBName:                 os.Getenv("DB_NAME"),
+		DatabaseURL:            os.Getenv("DATABASE_URL"),
+		RedisURL:               os.Getenv("REDIS_URL"),
 		RedisAddr:              os.Getenv("REDIS_ADDR"),
 		RedisPassword:          os.Getenv("REDIS_PASSWORD"),
 		RedisDB:                redisDB,

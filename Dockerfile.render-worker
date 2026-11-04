@@ -1,0 +1,20 @@
+FROM golang:1.27.3 AS build
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . ./
+RUN CGO_ENABLED=0 go build -trimpath -o /out/dekho-worker ./cmd/worker
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=build /out/dekho-worker ./dekho-worker
+
+ENV ADDR=0.0.0.0
+ENV ROOT_PATH=/tmp/dekho-worker
+EXPOSE 10000
+CMD ["/app/dekho-worker"]

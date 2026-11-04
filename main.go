@@ -29,6 +29,7 @@ import (
 	"video-streaming-server/services"
 	"video-streaming-server/shared"
 	"video-streaming-server/shared/logger"
+	"video-streaming-server/shared/redisconn"
 	"video-streaming-server/sse"
 	"video-streaming-server/statusbus"
 	"video-streaming-server/types"
@@ -327,6 +328,7 @@ func serverSentEventsHandler(w http.ResponseWriter, r *http.Request) {
 
 func setUpRoutes(queueClient *asynq.Client) {
 	logger.Log.Debug("setting up routes")
+	http.HandleFunc("/healthz", shared.HealthHandler)
 	http.HandleFunc("/", utils.Chain(homePageHandler, mw.Logging))
 	http.HandleFunc("/register", utils.Chain(registerPageHandler, mw.Logging))
 	http.HandleFunc("/login", utils.Chain(loginPageHandler, mw.Logging))
@@ -360,9 +362,12 @@ func main() {
 		os.Exit(1)
 	}
 	defer cleanupDB.Close()
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: config.AppConfig.RedisAddr, Password: config.AppConfig.RedisPassword, DB: config.AppConfig.RedisDB,
-	})
+	redisOptions, err := redisconn.GoRedisOptions()
+	if err != nil {
+		slog.Error("Failed to configure Redis", "error", err)
+		os.Exit(1)
+	}
+	redisClient := redis.NewClient(redisOptions)
 	redisCtx, redisCancel := context.WithTimeout(ctx, 5*time.Second)
 	if err := redisClient.Ping(redisCtx).Err(); err != nil {
 		redisCancel()
@@ -371,9 +376,12 @@ func main() {
 	}
 	redisCancel()
 	defer redisClient.Close()
-	asynqClient := asynq.NewClient(asynq.RedisClientOpt{
-		Addr: config.AppConfig.RedisAddr, Password: config.AppConfig.RedisPassword, DB: config.AppConfig.RedisDB,
-	})
+	asynqRedisOptions, err := redisconn.AsynqOptions()
+	if err != nil {
+		slog.Error("Failed to configure Asynq Redis connection", "error", err)
+		os.Exit(1)
+	}
+	asynqClient := asynq.NewClient(asynqRedisOptions)
 	defer asynqClient.Close()
 	bus, err := statusbus.New(cleanupDB, redisClient)
 	if err != nil {

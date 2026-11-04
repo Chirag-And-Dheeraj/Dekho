@@ -12,7 +12,11 @@ require (
 	github.com/go-playground/validator v9.31.0+incompatible
 	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/google/uuid v1.6.0
+	github.com/hibiken/asynq v0.24.1
+	github.com/hibiken/asynqmon v0.7.2
+	github.com/jackc/pgx/v5 v5.7.2
 	github.com/lib/pq v1.10.9
+	github.com/redis/go-redis/v9 v9.17.3
 	golang.org/x/crypto v0.34.0
 )
 
@@ -43,19 +47,22 @@ require (
 	github.com/go-playground/universal-translator v0.18.1 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/gohugoio/hugo v0.144.2 // indirect
-	github.com/golang/protobuf v1.5.2 // indirect
-	github.com/hibiken/asynq v0.24.1 // indirect
+	github.com/golang/protobuf v1.5.3 // indirect
+	github.com/gorilla/mux v1.8.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/pelletier/go-toml v1.9.5 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.3 // indirect
-	github.com/redis/go-redis/v9 v9.17.3 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/spf13/afero v1.12.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/stretchr/testify v1.10.0 // indirect
 	github.com/tdewolff/parse/v2 v2.7.20 // indirect
+	golang.org/x/sync v0.11.0 // indirect
 	golang.org/x/sys v0.37.0 // indirect
 	golang.org/x/text v0.22.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
