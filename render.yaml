@@ -1,0 +1,105 @@
+services:
+  # Change this name to the exact name of the existing Render API service
+  # before syncing the Blueprint, so Render updates it instead of creating a duplicate.
+  - type: web
+    name: dekho-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile.render-api
+    dockerContext: .
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: APPWRITE_PROJECT_ID
+        sync: false
+      - key: APPWRITE_KEY
+        sync: false
+      - key: BUCKET_ID
+        sync: false
+      - key: APPWRITE_S3_ENDPOINT
+        sync: false
+      - key: APPWRITE_RESPONSE_FORMAT
+        value: "1.4.0"
+      - key: APPWRITE_S3_REGION
+        value: auto
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: ADDR
+        value: 0.0.0.0
+      - key: SSL_MODE
+        value: require
+      - key: FILE_SIZE_LIMIT
+        value: "209715200"
+      - key: DEBUG
+        value: "false"
+      - key: API_INSTANCE_ID
+        value: dekho-api
+      - key: REDIS_DB
+        value: "0"
+
+  - type: web
+    name: dekho-worker
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile.render-worker
+    dockerContext: .
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: APPWRITE_PROJECT_ID
+        sync: false
+      - key: APPWRITE_KEY
+        sync: false
+      - key: BUCKET_ID
+        sync: false
+      - key: APPWRITE_S3_ENDPOINT
+        sync: false
+      - key: APPWRITE_RESPONSE_FORMAT
+        value: "1.4.0"
+      - key: APPWRITE_S3_REGION
+        value: auto
+      - key: ADDR
+        value: 0.0.0.0
+      - key: ROOT_PATH
+        value: /tmp/dekho-worker
+      - key: SSL_MODE
+        value: require
+      - key: DEBUG
+        value: "false"
+      - key: REDIS_DB
+        value: "0"
+      - key: WORKER_CONCURRENCY
+        value: "1"
+      - key: WORKER_SHUTDOWN_TIMEOUT
+        value: 2m
+      - key: VIDEO_TASK_TIMEOUT
+        value: 6h
+      - key: VIDEO_TASK_MAX_RETRIES
+        value: "5"
+      - key: VIDEO_TASK_RETENTION
+        value: 24h
+      - key: VIDEO_TASK_UNIQUE_TTL
+        value: 24h
+
+  - type: web
+    name: dekho-asynqmon
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile.render-asynqmon
+    dockerContext: .
+    healthCheckPath: /healthz
+    envVars:
+      - key: REDIS_URL
+        sync: false
+      - key: ASYNQMON_USER
+        sync: false
+      - key: ASYNQMON_PASSWORD
+        sync: false
+      - key: DEBUG
+        value: "false"

@@ -15,7 +15,7 @@ import (
 //
 // Recipients is an array of string which is joined using comma (,)
 // separator in the function, creating a comma separated string
-func SendEmail(msg *types.EmailPayload) error {
+func SendEmail(msg types.EmailPayload) error {
 	if len(msg.Recipients) == 0 {
 		return errors.New("Recipients should not be emtpy")
 	}

@@ -24,13 +24,39 @@ Dekho is a research and study project aimed at understanding and learning about 
   - Set `APPWRITE_S3_ENDPOINT` to the project's regional S3 endpoint (for example, `https://fra.cloud.appwrite.io/v1/s3`) and `APPWRITE_S3_REGION` to `auto` or the Appwrite region code. The API key needs the `buckets.read`, `buckets.write`, `files.read`, and `files.write` scopes.
   - Browser uploads send cross-origin `PUT` requests to this S3 endpoint, which require an `OPTIONS` preflight. Appwrite's S3 API allows browser requests from any origin by default and does not implement per-bucket CORS settings, so no Appwrite bucket CORS setup is needed. If you put a proxy in front of the endpoint or use a self-hosted deployment with different CORS behavior, allow `OPTIONS` and `PUT`, permit the request's `Content-Type` header, and expose the `ETag` response header to the browser.
   - Uploads not completed within 24 hours are automatically removed, including their multipart data and any source object. Cleanup runs every 15 minutes while the server is running.
+  - Video processing runs in a separate worker service. The API enqueues work through Asynq on Redis; processing status is saved in PostgreSQL and relayed through Redis Streams to the API's SSE endpoint.
+- Docker Compose starts Redis with persistent storage and a read-only Asynqmon UI at `http://localhost:8081` (configurable with `ASYNQMON_PORT`; read-only mode uses `ASYNQMON_READ_ONLY`, default `true`). Successfully completed video tasks are retained in Redis for 24 hours so they remain visible in Asynqmon. Asynq's default successful-task retention is zero, which deletes tasks on completion. The UI binds to localhost by default; for hosted deployments, expose it only through an authenticated access path.
+- Asynq task settings are configurable in `.env`: `VIDEO_TASK_MAX_RETRIES` (default `5`), `VIDEO_TASK_TIMEOUT` (`6h`), `VIDEO_TASK_RETENTION` (`24h`), `VIDEO_TASK_UNIQUE_TTL` (`24h`), `WORKER_CONCURRENCY` (`2`), and `WORKER_SHUTDOWN_TIMEOUT` (`2m`). Use Go duration syntax for duration values; set retention to `0s` to remove completed tasks immediately or unique TTL to `0s` to disable enqueue deduplication. Asynqmon is the monitoring UI; retries, processing timeouts, and task retention are Asynq settings.
+
+### Render POC deployment
+
+`render.yaml` describes the API, the Asynq worker hosted as a free Render Web Service, and an authenticated, read-only Asynqmon Web Service. Redis and PostgreSQL remain external managed services: use the Neon connection URL for `DATABASE_URL` and the Upstash TCP/TLS URL (`rediss://...`) for `REDIS_URL`. The shared Go packages are compiled into the API, worker, and Asynqmon binaries; each Render service uses its own Dockerfile and image.
+
+Before syncing the Blueprint, change the `dekho-api` service name in `render.yaml` to exactly match the name of the API Web Service that already exists in your Render workspace. This lets Render update that service rather than create a duplicate. Render prompts for the database, Redis, Appwrite, JWT, and Asynqmon credentials during the initial Blueprint setup. If the API is not currently using the JWT secret you enter, existing login cookies will be invalidated.
+
+The worker exposes `GET /healthz` on Render's `PORT` while running the Asynq server in the same process. `WORKER_CONCURRENCY` defaults to `1` in the Render Blueprint to limit load on the free instance. The deployment intentionally does not include a keep-alive process; run that outside this repository while using the POC. The free Render services can still be restarted at any time, so Redis queue persistence and the API's pending-video reconciliation remain important.
+
+Asynqmon is read-only and protected by HTTP Basic Auth (`ASYNQMON_USER` and `ASYNQMON_PASSWORD`). Keep those credentials private. For the locally hosted worker health endpoint, use `WORKER_HEALTH_PORT` (default `8082` in `.env.local`).
 
 ### With Docker
 
 - Install `docker-compose` on your machine.
 - cd into the root of the repository.
   - Create a `.env` file using **_[.env.docker](.env.docker)_** as a reference.
-- Just run `docker-compose up` to start the server.
+- Run `docker compose up --build` to start the API, worker, PostgreSQL, Redis, and Asynqmon.
+
+### With Docker in GitHub Codespaces
+
+- Create a `.env` file using **_[.env.docker](.env.docker)_** as a reference.
+- Run `docker compose -f docker-compose.yml -f docker-compose.codespaces.yml up --build -d`.
+- Open port `8000` from the Codespaces **Ports** tab to use the app.
+- Open port `8081` to view the Asynqmon queue dashboard.
+- Stop the services with `docker compose -f docker-compose.yml -f docker-compose.codespaces.yml down`.
+
+#### Separate service terminals in VS Code
+
+- Open **Run and Debug**, select **Dekho: All services (separate terminals)**, and press **F5**. This starts the Codespaces Compose stack, then opens a terminal following logs for PostgreSQL, Redis, Asynqmon, the API, the worker, and the Codespaces proxy.
+- Stop the log sessions with **Shift+F5**. To stop the containers too, run **Tasks: Run Task** and select **Dekho: Stop Compose stack (Codespaces)**.
 
 ### Without Docker
 
@@ -45,13 +71,15 @@ Dekho is a research and study project aimed at understanding and learning about 
   - Enter the `psql` shell by running this command `sudo -u postgres psql` and create a database by running `CREATE DATABASE <database_name>;`.
   - Create a `.env` file using **_[.env.local](.env.local)_** as a reference.
 - Once the dependencies are installed successfully, run `make cleanstart`.
-- This command will create all the necessary folders and start the server on `http://127.0.0.1:8000`
+- This command will create all the necessary folders and start the API server on `http://127.0.0.1:8000`. Redis must also be running; use `make start-redis` or start it through Docker Compose.
 - If you just want to run the server, run: `make start`
+- To start a worker locally, run: `make start-worker`.
 - If you just want to clean up, run: `make clean`
 
 ## Technologies Used
 
-- **Server:** Go
+- **API and worker:** Go, with Asynq for background processing
+- **Queue and status events:** Redis (Asynq queue and Redis Streams)
 - **Database:** PostgreSQL
 - **Storage:** [Appwrite Storage](https://appwrite.io/docs/products/storage)
 - **Video Processing:** [FFMPEG](https://ffmpeg.org) for breaking down videos into .ts chunks

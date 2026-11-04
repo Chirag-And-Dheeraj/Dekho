@@ -8,6 +8,8 @@ manifests/
 thumbnails/
 database.db
 main
-.vscode/
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
 tmp/
 .gitpod.yml

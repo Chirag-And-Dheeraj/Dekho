@@ -1,25 +1,103 @@
 version: '3.9'
 
 services:
+  dekho-redis:
+    container_name: dekho-redis
+    image: redis:7-alpine
+    command:
+      - sh
+      - -c
+      - 'if [ -n "$$REDIS_PASSWORD" ]; then exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"; else exec redis-server --appendonly yes; fi'
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli -a \"$$REDIS_PASSWORD\" ping; else redis-cli ping; fi"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  asynqmon:
+    container_name: dekho-asynqmon
+    image: hibiken/asynqmon:0.7.2
+    environment:
+      REDIS_ADDR: dekho-redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: ${REDIS_DB:-0}
+      READ_ONLY: "${ASYNQMON_READ_ONLY:-true}"
+    ports:
+      - "${ASYNQMON_BIND_ADDRESS:-127.0.0.1}:${ASYNQMON_PORT:-8081}:8080"
+    depends_on:
+      dekho-redis:
+        condition: service_healthy
+
   dekho:
     container_name: dekho
     build: .
     env_file:
       - ".env"
     environment:
-      DB_HOST: ${DB_HOST}
+      DB_HOST: host.docker.internal
       DB_USER: ${DB_USER}
       DB_NAME: ${DB_NAME}
       DB_PASSWORD: ${DB_PASSWORD}
       DB_PORT: ${DB_PORT}
+      SSL_MODE: disable
+      DEBUG: ${DEBUG:-false}
+      REDIS_ADDR: dekho-redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: ${REDIS_DB:-0}
+      API_INSTANCE_ID: dekho-api
+      VIDEO_TASK_MAX_RETRIES: ${VIDEO_TASK_MAX_RETRIES:-5}
+      VIDEO_TASK_TIMEOUT: ${VIDEO_TASK_TIMEOUT:-6h}
+      VIDEO_TASK_RETENTION: ${VIDEO_TASK_RETENTION:-24h}
+      VIDEO_TASK_UNIQUE_TTL: ${VIDEO_TASK_UNIQUE_TTL:-24h}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${PORT}:${PORT}"
     depends_on:
       dekho-postgres:
         condition: service_healthy
+      dekho-redis:
+        condition: service_healthy
     volumes:
       - ./:/app
     command: ./scripts/start_dev.sh
+
+  dekho-worker:
+    container_name: dekho-worker
+    build: .
+    env_file:
+      - ".env"
+    environment:
+      DB_HOST: host.docker.internal
+      DB_USER: ${DB_USER}
+      DB_NAME: ${DB_NAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_PORT: ${DB_PORT}
+      SSL_MODE: disable
+      DEBUG: ${DEBUG:-false}
+      ROOT_PATH: /tmp/dekho-worker
+      REDIS_ADDR: dekho-redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: ${REDIS_DB:-0}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      WORKER_SHUTDOWN_TIMEOUT: ${WORKER_SHUTDOWN_TIMEOUT:-2m}
+      WORKER_HEALTH_PORT: ${WORKER_HEALTH_PORT:-8001}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      dekho:
+        condition: service_started
+      dekho-redis:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    command: ./scripts/start_worker.sh
 
   dekho-postgres:
     container_name: dekho-postgres
@@ -35,7 +113,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      test: ["CMD-SHELL", "pg_isready -h dekho-postgres -p 5432 -U ${DB_USER} -d ${DB_NAME}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -43,3 +121,4 @@ services:
 
 volumes:
   pgdata: {}
+  redisdata: {}

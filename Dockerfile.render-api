@@ -1,0 +1,25 @@
+FROM golang:1.27.3 AS build
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . ./
+RUN CGO_ENABLED=0 go build -trimpath -o /out/dekho-api .
+RUN go install -tags 'pgx5' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=build /out/dekho-api ./dekho-api
+COPY --from=build /go/bin/migrate /usr/local/bin/migrate
+COPY database/migrations ./database/migrations
+COPY client ./client
+COPY static ./static
+COPY scripts/start_render_api.sh ./scripts/start_render_api.sh
+
+ENV ADDR=0.0.0.0
+EXPOSE 10000
+CMD ["/bin/sh", "/app/scripts/start_render_api.sh"]

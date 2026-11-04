@@ -2,6 +2,7 @@ const eventSource = new EventSource(`${window.ENV.API_URL}/server-events/`, {
   withCredentials: true,
 });
 const toaster = new Toast();
+const handledEventIDs = new Set();
 
 eventSource.onopen = () => {
   console.log("SSE connected");
@@ -9,13 +10,19 @@ eventSource.onopen = () => {
 
 eventSource.onerror = (error) => {
   console.error("SSE Error:", error);
-  eventSource.close();
 };
 
 // TODO: handle case when event comes when the element is not in the DOM
 eventSource.addEventListener("video_status", (event) => {
   try {
     const data = JSON.parse(event.data);
+    if (event.lastEventId) {
+      if (handledEventIDs.has(event.lastEventId)) return;
+      handledEventIDs.add(event.lastEventId);
+      if (handledEventIDs.size > 256) {
+        handledEventIDs.delete(handledEventIDs.values().next().value);
+      }
+    }
     console.log("Update event received:", data);
 
     const { id: videoId, status: videoStatus, title: videoTitle = "Unknown Video", thumbnail } = data;

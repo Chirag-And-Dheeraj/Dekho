@@ -1,1 +1,10 @@
-*.exe
+.git
+.env
+.env.*
+video
+hls_chunks
+manifests
+thumbnails
+segments
+bin
+*.log
